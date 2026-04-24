@@ -784,6 +784,12 @@ class DeepseekV4Model(nn.Module):
                 else:
                     if is_pp_missing_parameter(name, self):
                         continue
+                    # hc_head_fn/base/scale are direct nn.Parameters that
+                    # only exist on the last PP rank. They can't be detected
+                    # via is_pp_missing_parameter (no corresponding
+                    # PPMissingLayer), so skip if absent from this rank.
+                    if name not in params_dict:
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
