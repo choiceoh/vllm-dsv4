@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
+    get_pp_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
@@ -46,10 +47,13 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.multi_stream_utils import AuxStreamType
 
+from .interfaces import SupportsPP
 from .utils import (
     AutoWeightsLoader,
+    PPMissingLayer,
     WeightsMapper,
     extract_layer_index,
+    is_pp_missing_parameter,
     make_layers,
     maybe_prefix,
 )
@@ -562,12 +566,15 @@ class DeepseekV4Model(nn.Module):
             device=self.device,
         )
 
-        self.embed_tokens = VocabParallelEmbedding(
-            config.vocab_size,
-            config.hidden_size,
-            quant_config=quant_config,
-            prefix=f"{prefix}.embed_tokens",
-        )
+        if get_pp_group().is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=f"{prefix}.embed_tokens",
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
 
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
@@ -580,50 +587,87 @@ class DeepseekV4Model(nn.Module):
             prefix=f"{prefix}.layers",
         )
 
-        self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
+        if get_pp_group().is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
 
-        self.hc_head_fn = nn.Parameter(
-            torch.empty(
-                self.hc_mult,
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(
+                    self.hc_mult,
+                    self.hc_dim,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.hc_head_base = nn.Parameter(
+                torch.empty(
+                    self.hc_mult,
+                    dtype=torch.float32,
+                ),
+                requires_grad=False,
+            )
+            self.hc_head_scale = nn.Parameter(
+                torch.empty(1, dtype=torch.float32),
+                requires_grad=False,
+            )
+
+            # Pre-hc_head residual stream buffer for the MTP draft. Stable
+            # address (outside the cudagraph pool) so the copy_ in forward()
+            # refreshes it correctly across captured shapes.
+            self._mtp_hidden_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
                 self.hc_dim,
-                dtype=torch.float32,
-            ),
-            requires_grad=False,
-        )
-        self.hc_head_base = nn.Parameter(
-            torch.empty(
-                self.hc_mult,
-                dtype=torch.float32,
-            ),
-            requires_grad=False,
-        )
-        self.hc_head_scale = nn.Parameter(
-            torch.empty(1, dtype=torch.float32),
-            requires_grad=False,
-        )
+                dtype=vllm_config.model_config.dtype,
+                device=self.device,
+            )
+        else:
+            self.norm = PPMissingLayer()
 
-        # Pre-hc_head residual stream buffer for the MTP draft. Stable
-        # address (outside the cudagraph pool) so the copy_ in forward()
-        # refreshes it correctly across captured shapes.
-        self._mtp_hidden_buffer = torch.empty(
-            vllm_config.scheduler_config.max_num_batched_tokens,
-            self.hc_dim,
-            dtype=vllm_config.model_config.dtype,
-            device=self.device,
-        )
+        # Between-layer hidden state carries an extra hc_mult dim, so the
+        # generic factory (2-D) is not usable here.
+        hc_mult = self.hc_mult
+        hidden_size = config.hidden_size
+
+        def _make_empty_intermediate_tensors(
+            batch_size: int,
+            dtype: torch.dtype,
+            device: torch.device,
+        ) -> IntermediateTensors:
+            return IntermediateTensors(
+                {
+                    "hidden_states": torch.zeros(
+                        (batch_size, hc_mult, hidden_size),
+                        dtype=dtype,
+                        device=device,
+                    ),
+                }
+            )
+
+        self.make_empty_intermediate_tensors = _make_empty_intermediate_tensors
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.embed_input_ids(input_ids)
-        hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                if input_ids is None:
+                    raise ValueError(
+                        "Either input_ids or inputs_embeds must be provided "
+                        "to DeepseekV4Model.forward on the first PP rank"
+                    )
+                hidden_states = self.embed_input_ids(input_ids)
+            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
 
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states = layer(
@@ -631,6 +675,9 @@ class DeepseekV4Model(nn.Module):
                 positions,
                 input_ids,
             )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors({"hidden_states": hidden_states})
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
@@ -680,6 +727,9 @@ class DeepseekV4Model(nn.Module):
                     continue
                 name = name.replace(weight_name, param_name)
 
+                if is_pp_missing_parameter(name, self):
+                    break
+
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -701,6 +751,8 @@ class DeepseekV4Model(nn.Module):
                         if weight_name not in name:
                             continue
                         name_mapped = name.replace(weight_name, param_name)
+                        if is_pp_missing_parameter(name_mapped, self):
+                            continue
                         param = params_dict[name_mapped]
                         # We should ask the weight loader to return success or not
                         # here since otherwise we may skip experts with other
@@ -722,12 +774,16 @@ class DeepseekV4Model(nn.Module):
                     loaded_params.add(name_mapped)
                     continue
                 elif "attn_sink" in name:
+                    if is_pp_missing_parameter(name, self):
+                        continue
                     narrow_weight = loaded_weight[head_rank_start:head_rank_end]
                     n = narrow_weight.shape[0]
                     params_dict[name][:n].copy_(narrow_weight)
                     loaded_params.add(name)
                     continue
                 else:
+                    if is_pp_missing_parameter(name, self):
+                        continue
                     param = params_dict[name]
                     weight_loader = getattr(
                         param, "weight_loader", default_weight_loader
@@ -769,7 +825,7 @@ def hc_head(
     return y.to(dtype)
 
 
-class DeepseekV4ForCausalLM(nn.Module):
+class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
     model_cls = DeepseekV4Model
 
     hf_to_vllm_mapper = WeightsMapper(
@@ -806,12 +862,18 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
-        self.lm_head = ParallelLMHead(
-            config.vocab_size,
-            config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        if get_pp_group().is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+        else:
+            self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
