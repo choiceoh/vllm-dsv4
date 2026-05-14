@@ -17,6 +17,15 @@ def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     return fp32_bits.view(torch.float32)
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4, num_stages=3),
+        triton.Config({}, num_warps=8, num_stages=3),
+        triton.Config({}, num_warps=4, num_stages=2),
+        triton.Config({}, num_warps=8, num_stages=2),
+    ],
+    key=["num_tokens", "num_groups", "out_rank", "hidden_size"],
+)
 @triton.jit
 def _deepseek_v4_sm12x_fp8_einsum_kernel(
     a_ptr,
@@ -174,8 +183,7 @@ def deepseek_v4_sm12x_fp8_einsum(
         BLOCK_TOKENS=block_tokens,
         BLOCK_OUT=block_out,
         BLOCK_HIDDEN=block_hidden,
-        num_warps=4,
-        num_stages=3,
+        # num_warps / num_stages supplied by @triton.autotune above.
     )
 
 
