@@ -6,11 +6,14 @@ from vllm.model_executor.layers.quantization.utils import fp8_utils
 from vllm.platforms import current_platform
 
 GB10_BLOCK_FP8_SHAPES = (
+    (1024, 4096),
     (1536, 4096),
     (16384, 1024),
     (2048, 4096),
     (4096, 1024),
+    (4096, 2048),
     (4096, 4096),
+    (4096, 512),
     (8192, 1024),
 )
 

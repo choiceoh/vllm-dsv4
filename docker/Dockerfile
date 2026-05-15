@@ -640,9 +640,11 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
 ARG FLASHINFER_VERSION=0.6.8.post1
+ARG FLASHINFER_CUDA_INDEX_VERSION
 RUN --mount=type=cache,target=/root/.cache/uv \
+    FLASHINFER_CUDA_INDEX_VERSION=${FLASHINFER_CUDA_INDEX_VERSION:-$CUDA_VERSION} && \
     uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
-        --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+        --extra-index-url https://flashinfer.ai/whl/cu$(echo $FLASHINFER_CUDA_INDEX_VERSION | cut -d. -f1,2 | tr -d '.')
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
