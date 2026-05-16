@@ -22,7 +22,6 @@ from vllm.platforms import current_platform
 from vllm.utils.platform_utils import num_compute_units
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.ops.deepseek_v4_ops import (
-    combine_c128a_swa_indices,
     combine_topk_swa_indices,
     compute_global_topk_indices_and_lens,
     dequantize_and_gather_k_cache,
@@ -1574,37 +1573,21 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             query_tokens = query_end - query_start
-            chunk_query_start_loc = query_start_loc[
-                num_decodes + chunk_start : num_decodes + chunk_end + 1
-            ]
-            if not swa_only and self.compress_ratio == 128:
-                combined_indices, combined_lens = combine_c128a_swa_indices(
-                    query_tokens,
-                    chunk_query_start_loc,
-                    seq_lens[chunk_start:chunk_end],
-                    gather_lens[chunk_start:chunk_end],
-                    self.window_size,
-                    self.compress_ratio,
-                    top_k,
-                    M,
-                    N,
-                    combined_indices=combined_indices_buffer[:query_tokens],
-                    combined_lens=combined_lens_buffer[:query_tokens],
-                )
-            else:
-                combined_indices, combined_lens = combine_topk_swa_indices(
-                    topk_indices[query_start:query_end],
-                    chunk_query_start_loc,
-                    seq_lens[chunk_start:chunk_end],
-                    gather_lens[chunk_start:chunk_end],
-                    self.window_size,
-                    self.compress_ratio,
-                    top_k,
-                    M,
-                    N,
-                    combined_indices=combined_indices_buffer[:query_tokens],
-                    combined_lens=combined_lens_buffer[:query_tokens],
-                )
+            combined_indices, combined_lens = combine_topk_swa_indices(
+                topk_indices[query_start:query_end],
+                query_start_loc[
+                    num_decodes + chunk_start : num_decodes + chunk_end + 1
+                ],
+                seq_lens[chunk_start:chunk_end],
+                gather_lens[chunk_start:chunk_end],
+                self.window_size,
+                self.compress_ratio,
+                top_k,
+                M,
+                N,
+                combined_indices=combined_indices_buffer[:query_tokens],
+                combined_lens=combined_lens_buffer[:query_tokens],
+            )
 
             if triton_sparse_mla_enabled:
                 self._forward_sparse_mla_prefill_triton(
