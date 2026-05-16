@@ -14,15 +14,6 @@ from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=4, num_stages=3),
-        triton.Config({}, num_warps=8, num_stages=3),
-        triton.Config({}, num_warps=4, num_stages=2),
-        triton.Config({}, num_warps=8, num_stages=2),
-    ],
-    key=["num_tokens", "num_groups", "out_rank", "hidden_size"],
-)
 @triton.jit
 def _deepseek_v4_sm12x_fp8_einsum_kernel(
     a_ptr,
@@ -180,7 +171,8 @@ def deepseek_v4_sm12x_fp8_einsum(
         BLOCK_TOKENS=block_tokens,
         BLOCK_OUT=block_out,
         BLOCK_HIDDEN=block_hidden,
-        # num_warps / num_stages supplied by @triton.autotune above.
+        num_warps=4,
+        num_stages=3,
     )
 
 
