@@ -80,6 +80,79 @@ def _reference_paged_mqa_logits(
     return logits
 
 
+def _make_prefill_mqa_topk_case(
+    rows: int,
+    kv_tokens: int,
+    topk_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+           torch.Tensor, torch.Tensor]:
+    num_heads, head_dim = 8, 32
+    q = torch.randn(
+        rows,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    q_fp8 = q.to(torch.float8_e4m3fn).contiguous()
+    kv = torch.randn(kv_tokens, head_dim, device="cuda", dtype=torch.bfloat16)
+    kv_scale = kv.abs().float().amax(dim=-1).clamp(1e-4) / 448.0
+    kv_fp8 = (kv * kv_scale.reciprocal()[:, None]).to(torch.float8_e4m3fn)
+    weights = (
+        torch.rand(rows, num_heads, device="cuda", dtype=torch.float32) + 0.1
+    ).contiguous()
+    row_offsets = torch.arange(rows, device="cuda", dtype=torch.int32)
+    cu_seqlen_ks = (row_offsets % 17).contiguous()
+    cu_seqlen_ke = (kv_tokens - (row_offsets % 19)).contiguous()
+    out = torch.empty(rows, topk_tokens, device="cuda", dtype=torch.int32)
+    return (
+        q_fp8,
+        kv_fp8.contiguous(),
+        kv_scale.contiguous(),
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        out,
+    )
+
+
+def _reference_prefill_mqa_topk(
+    q_fp8: torch.Tensor,
+    kv_fp8: torch.Tensor,
+    kv_scale: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_tokens: int,
+) -> torch.Tensor:
+    rows, _, _ = q_fp8.shape
+    kv_tokens = kv_fp8.shape[0]
+    logits = torch.zeros(rows, kv_tokens, device="cuda", dtype=torch.float32)
+    q_ref = q_fp8.float()
+    kv_ref = kv_fp8.float() * kv_scale[:, None]
+    for head_idx in range(q_fp8.shape[1]):
+        scores = torch.relu(q_ref[:, head_idx] @ kv_ref.T)
+        logits += scores * weights[:, head_idx, None]
+    offsets = torch.arange(kv_tokens, device="cuda")
+    valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
+        offsets[None, :] < cu_seqlen_ke[:, None]
+    )
+    logits.masked_fill_(~valid, float("-inf"))
+    values, indices = torch.topk(logits, topk_tokens, dim=1)
+    return indices.to(torch.int32).masked_fill(~torch.isfinite(values), -1)
+
+
+def _assert_same_topk_set(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    # Sparse MLA uses top-k candidates as a set. Different exact top-k
+    # implementations can return the same candidates in a different order.
+    torch.testing.assert_close(
+        torch.sort(actual, dim=1).values,
+        torch.sort(expected, dim=1).values,
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_decode_logits_width_uses_active_context_bound():
     assert _decode_logits_width(262144, 1024) == 1024
     assert _decode_logits_width(4096, 8192) == 4096
@@ -92,6 +165,122 @@ def test_decode_topk_logits_width_keeps_topk_kernel_width():
     assert _decode_topk_logits_width(262144, 128, 512) == 512
     assert _decode_topk_logits_width(300, 128, 512) == 300
     assert _decode_topk_logits_width(0, 128, 512) == 0
+
+
+def test_sm120_triton_prefill_mqa_topk_gate_uses_row_band(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON", "1")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS", "64")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS", "256")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS", "8192")
+
+    q_small = torch.empty(63, 64, 128)
+    q_target = torch.empty(128, 64, 128)
+    q_topk512_min = torch.empty(64, 64, 128)
+    q_large = torch.empty(8192, 64, 128)
+    k = torch.empty(131072, 128)
+    topk = torch.empty(128, 2048, dtype=torch.int32)
+    topk512 = torch.empty(64, 512, dtype=torch.int32)
+
+    assert not sm12x_deep_gemm_fallbacks._use_triton_prefill_mqa_topk(
+        q_small, k, topk[:63]
+    )
+    assert sm12x_deep_gemm_fallbacks._use_triton_prefill_mqa_topk(
+        q_topk512_min, k, topk512
+    )
+    assert not sm12x_deep_gemm_fallbacks._use_triton_prefill_mqa_topk(
+        q_topk512_min, k, torch.empty(64, 2048, dtype=torch.int32)
+    )
+    assert sm12x_deep_gemm_fallbacks._use_triton_prefill_mqa_topk(
+        q_target, k, topk
+    )
+    assert not sm12x_deep_gemm_fallbacks._use_triton_prefill_mqa_topk(
+        q_large, k, torch.empty(8192, 2048, dtype=torch.int32)
+    )
+
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS", "0")
+    assert sm12x_deep_gemm_fallbacks._use_triton_prefill_mqa_topk(
+        q_large, k, torch.empty(8192, 2048, dtype=torch.int32)
+    )
+
+
+def test_sm120_triton_prefill_mqa_topk_rejects_cpu_without_mutation():
+    from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
+        fp8_mqa_topk_indices_triton,
+    )
+
+    rows, kv_tokens, num_heads, head_dim, topk_tokens = 2, 512, 8, 32, 512
+    q = torch.empty(rows, num_heads, head_dim, dtype=torch.float8_e4m3fn)
+    kv = torch.empty(kv_tokens, head_dim, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(kv_tokens, dtype=torch.float32)
+    weights = torch.empty(rows, num_heads, dtype=torch.float32)
+    cu_seqlen_ks = torch.zeros(rows, dtype=torch.int32)
+    cu_seqlen_ke = torch.full((rows,), kv_tokens, dtype=torch.int32)
+    out = torch.full((rows, topk_tokens), 123, dtype=torch.int32)
+
+    assert not fp8_mqa_topk_indices_triton(
+        q, (kv, scale), weights, cu_seqlen_ks, cu_seqlen_ke, out
+    )
+    assert torch.all(out == 123)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA only")
+def test_sm120_triton_prefill_mqa_topk_rejects_bad_metadata_without_mutation():
+    from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
+        fp8_mqa_topk_indices_triton,
+    )
+
+    torch.manual_seed(12)
+    q, kv, scale, weights, cu_seqlen_ks, cu_seqlen_ke, out = (
+        _make_prefill_mqa_topk_case(rows=64, kv_tokens=1024, topk_tokens=512)
+    )
+
+    def assert_rejected(
+        q_arg: torch.Tensor = q,
+        kv_arg: torch.Tensor = kv,
+        scale_arg: torch.Tensor = scale,
+        weights_arg: torch.Tensor = weights,
+        cu_ks_arg: torch.Tensor = cu_seqlen_ks,
+        cu_ke_arg: torch.Tensor = cu_seqlen_ke,
+        out_arg: torch.Tensor = out,
+    ) -> None:
+        out_arg.fill_(123)
+        assert not fp8_mqa_topk_indices_triton(
+            q_arg,
+            (kv_arg, scale_arg),
+            weights_arg,
+            cu_ks_arg,
+            cu_ke_arg,
+            out_arg,
+        )
+        assert torch.all(out_arg == 123)
+
+    assert_rejected(weights_arg=weights[:, :7])
+    assert_rejected(weights_arg=weights.to(torch.bfloat16))
+    assert_rejected(cu_ks_arg=cu_seqlen_ks.to(torch.int64))
+    assert_rejected(cu_ke_arg=cu_seqlen_ke[:63])
+    assert_rejected(kv_arg=torch.empty(1024, 64, device="cuda",
+                                       dtype=torch.float8_e4m3fn))
+    assert_rejected(scale_arg=scale[:1023])
+    assert_rejected(out_arg=torch.full((63, 512), 123, device="cuda",
+                                       dtype=torch.int32))
+    assert_rejected(scale_arg=scale.cpu())
+
+    q_noncontig = torch.empty(
+        64, 8, 64, device="cuda", dtype=torch.float8_e4m3fn
+    )[:, :, ::2]
+    kv_noncontig = torch.empty(
+        1024, 64, device="cuda", dtype=torch.float8_e4m3fn
+    )[:, ::2]
+    scale_noncontig = torch.empty(2048, device="cuda", dtype=torch.float32)[::2]
+    out_noncontig = torch.full(
+        (64, 1024), 123, device="cuda", dtype=torch.int32
+    )[:, ::2]
+    assert_rejected(q_arg=q_noncontig)
+    assert_rejected(kv_arg=kv_noncontig)
+    assert_rejected(scale_arg=scale_noncontig)
+    assert_rejected(out_arg=out_noncontig)
 
 
 @pytest.mark.skipif(
@@ -182,3 +371,92 @@ def test_sm120_paged_mqa_direct_topk_matches_truncated_decode_width(
 
     torch.testing.assert_close(truncated_width_topk, full_width_topk, rtol=0, atol=0)
     torch.testing.assert_close(truncated_width_topk, expected_topk, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+@pytest.mark.parametrize(
+    "rows,topk_tokens,kv_tokens", [(64, 512, 1024), (128, 2048, 2304)]
+)
+def test_sm120_triton_prefill_mqa_topk_matches_reference(
+    rows: int,
+    topk_tokens: int,
+    kv_tokens: int,
+):
+    from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
+        fp8_mqa_topk_indices_triton,
+    )
+
+    torch.manual_seed(11)
+    q_fp8, kv_fp8, kv_scale, weights, cu_seqlen_ks, cu_seqlen_ke, actual = (
+        _make_prefill_mqa_topk_case(
+            rows=rows,
+            kv_tokens=kv_tokens,
+            topk_tokens=topk_tokens,
+        )
+    )
+
+    assert fp8_mqa_topk_indices_triton(
+        q_fp8,
+        (kv_fp8, kv_scale.contiguous()),
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        actual,
+    )
+
+    expected = _reference_prefill_mqa_topk(
+        q_fp8,
+        kv_fp8,
+        kv_scale,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_tokens,
+    )
+
+    _assert_same_topk_set(actual, expected)
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(120), reason="SM120 only"
+)
+def test_sm120_triton_prefill_mqa_topk_pads_short_valid_ranges():
+    from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
+        fp8_mqa_topk_indices_triton,
+    )
+
+    torch.manual_seed(13)
+    topk_tokens = 512
+    q_fp8, kv_fp8, kv_scale, weights, cu_seqlen_ks, cu_seqlen_ke, actual = (
+        _make_prefill_mqa_topk_case(
+            rows=64,
+            kv_tokens=1024,
+            topk_tokens=topk_tokens,
+        )
+    )
+    cu_seqlen_ks.fill_(17)
+    cu_seqlen_ke.fill_(145)
+
+    assert fp8_mqa_topk_indices_triton(
+        q_fp8,
+        (kv_fp8, kv_scale.contiguous()),
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        actual,
+    )
+
+    expected = _reference_prefill_mqa_topk(
+        q_fp8,
+        kv_fp8,
+        kv_scale,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_tokens,
+    )
+
+    _assert_same_topk_set(actual, expected)
+    assert (actual == -1).sum(dim=1).min().item() == topk_tokens - 128

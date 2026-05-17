@@ -132,6 +132,7 @@ nvfp4_block_scale_interleave = _lazy_import_wrapper(
 flashinfer_cute_dsl_fused_moe_nvfp4 = _lazy_import_wrapper(
     "flashinfer", "cute_dsl_fused_moe_nvfp4"
 )
+flashinfer_b12x_fused_moe = _lazy_import_wrapper("flashinfer", "b12x_fused_moe")
 flashinfer_convert_sf_to_mma_layout = _lazy_import_wrapper(
     "flashinfer.cute_dsl.utils", "convert_sf_to_mma_layout"
 )
@@ -266,6 +267,32 @@ def has_flashinfer_cutedsl_moe_nvfp4() -> bool:
         return False
     mod = _get_submodule("flashinfer")
     return mod is not None and hasattr(mod, "cute_dsl_fused_moe_nvfp4")
+
+
+@functools.cache
+def has_flashinfer_b12x_fused_moe() -> bool:
+    """Return ``True`` if FlashInfer B12x SM12x W4A16 MoE is available."""
+    if not has_flashinfer_cutedsl():
+        return False
+    required_functions = [
+        (
+            "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch",
+            "launch_sm120_moe",
+        ),
+        (
+            "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch",
+            "_get_cached_workspace",
+        ),
+        (
+            "flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare",
+            "prepare_w4a16_packed_weights",
+        ),
+    ]
+    for module_name, attr_name in required_functions:
+        mod = _get_submodule(module_name)
+        if not mod or not hasattr(mod, attr_name):
+            return False
+    return True
 
 
 @functools.cache
@@ -937,6 +964,7 @@ __all__ = [
     "has_flashinfer_cutlass_fused_moe",
     "has_flashinfer_cutedsl_grouped_gemm_nt_masked",
     "has_flashinfer_cutedsl_moe_nvfp4",
+    "has_flashinfer_b12x_fused_moe",
     "has_flashinfer_fp8_blockscale_gemm",
     "has_nvidia_artifactory",
     "supports_trtllm_attention",
