@@ -15,7 +15,6 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionRequest,
     ChatCompletionToolsParam,
 )
-from vllm.entrypoints.openai.engine.serving import OpenAIServing
 from vllm.tool_parsers import ToolParserManager
 from vllm.tool_parsers.deepseekv4_tool_parser import DeepSeekV4ToolParser
 
@@ -237,44 +236,3 @@ def test_extract_tool_calls_arguments_wrapper():
     assert result.tools_called
     args = json.loads(result.tool_calls[0].function.arguments)
     assert args == {"location": "Beijing"}
-
-
-def test_named_tool_choice_uses_dsml_parser_when_strict(
-    monkeypatch: pytest.MonkeyPatch,
-    sample_tools: list[ChatCompletionToolsParam],
-) -> None:
-    tool = sample_tools[0]
-    monkeypatch.setattr(
-        DeepSeekV4ToolParser, "supports_required_and_named", False
-    )
-
-    request = ChatCompletionRequest(
-        messages=[],
-        model="m",
-        tools=sample_tools,
-    )
-    request.tool_choice = ChatCompletionNamedToolChoiceParam(
-        function=ChatCompletionNamedFunction(name=tool.function.name)
-    )
-    model_output = build_tool_call(
-        tool.function.name,
-        {"city": "Boston", "state": "MA", "unit": "fahrenheit"},
-    )
-
-    tool_calls, content = OpenAIServing._parse_tool_calls_from_content(
-        request=request,
-        tokenizer=MOCK_TOKENIZER,
-        enable_auto_tools=True,
-        tool_parser_cls=DeepSeekV4ToolParser,
-        content=model_output,
-    )
-
-    assert content is None
-    assert tool_calls is not None
-    assert len(tool_calls) == 1
-    assert tool_calls[0].name == tool.function.name
-    assert json.loads(tool_calls[0].arguments) == {
-        "city": "Boston",
-        "state": "MA",
-        "unit": "fahrenheit",
-    }

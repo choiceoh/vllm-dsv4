@@ -66,8 +66,6 @@ class Mxfp4MoeBackend(Enum):
     # FlashInfer CUTLASS backends
     FLASHINFER_CUTLASS_MXFP4_MXFP8 = "FLASHINFER_CUTLASS_MXFP4_MXFP8"
     FLASHINFER_CUTLASS_MXFP4_BF16 = "FLASHINFER_CUTLASS_MXFP4_BF16"
-    # FlashInfer B12x SM12x backend
-    FLASHINFER_B12X_MXFP4_BF16 = "FLASHINFER_B12X_MXFP4_BF16"
     # Marlin
     BATCHED_MARLIN = "BATCHED_MARLIN"
     MARLIN = "MARLIN"
@@ -137,13 +135,6 @@ def backend_to_kernel_cls(
         )
 
         return [FlashInferExperts]
-
-    elif backend == Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16:
-        from vllm.model_executor.layers.fused_moe.experts.flashinfer_b12x_moe import (
-            FlashInferB12xW4A16Experts,
-        )
-
-        return [FlashInferB12xW4A16Experts]
 
     elif backend == Mxfp4MoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
@@ -236,7 +227,6 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> list[Mxfp4MoeBackend]:
             Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
         ],
         "flashinfer_cutlass_afp8": [Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8],
-        "flashinfer_b12x": [Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16],
         "triton": [Mxfp4MoeBackend.TRITON],
         "triton_unfused": [Mxfp4MoeBackend.TRITON_UNFUSED],
         "humming": [Mxfp4MoeBackend.HUMMING],
@@ -450,19 +440,6 @@ def select_mxfp4_moe_backend(
     )
 
     # Handle explicit FlashInfer MXFP4 BF16 configuration.
-    if (
-        envs.is_set("VLLM_USE_FLASHINFER_MOE_B12X_W4A16")
-        and envs.VLLM_USE_FLASHINFER_MOE_B12X_W4A16
-    ):
-        return _return_or_raise(
-            Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16,
-            config,
-            kMxfp4Static,
-            None,
-            activation_format,
-        )
-
-    # Handle explicit FlashInfer MXFP4 BF16 configuration.
     if envs.is_set("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16"):
         if not envs.VLLM_USE_FLASHINFER_MOE_MXFP4_BF16:
             for _b in (
@@ -604,18 +581,6 @@ def select_deepseek_v4_mxfp4_moe_backend(
         assert last_error is not None
         raise last_error
 
-    if (
-        envs.is_set("VLLM_USE_FLASHINFER_MOE_B12X_W4A16")
-        and envs.VLLM_USE_FLASHINFER_MOE_B12X_W4A16
-    ):
-        return _return_or_raise(
-            Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16,
-            config,
-            kMxfp4Static,
-            None,
-            activation_format,
-        )
-
     # DeepSeek-V4 on ROCm is more accurate with the unfused Triton MXFP4 path
     # than the default AITER path. Prefer Triton-unfused for this routing mode,
     # while keeping AITER as a fallback if Triton-unfused rejects the config.
@@ -668,7 +633,6 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     elif backend in (
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
-        Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16,
     ):
         intermediate_size = round_up(intermediate_size, 128)
         hidden_size = round_up(hidden_size, 128)
@@ -678,62 +642,6 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
     else:
         intermediate_size = round_up(intermediate_size, 64)
     return hidden_size, intermediate_size
-
-
-def _e8m0_uint8_to_float32(sf: torch.Tensor) -> torch.Tensor:
-    return (sf.to(torch.int32) << 23).view(torch.float32)
-
-
-def _swizzle_flashinfer_w4a16_scales(
-    scales: torch.Tensor,
-    rows: int,
-    cols_blocks: int,
-) -> torch.Tensor:
-    rows_padded = round_up(rows, 128)
-    cols_padded = round_up(cols_blocks, 4)
-    padded = torch.zeros(
-        (rows_padded, cols_padded),
-        dtype=torch.float8_e4m3fn,
-        device=scales.device,
-    )
-    padded[:rows, :cols_blocks] = scales
-    swizzled = padded.reshape(rows_padded // 128, 4, 32, cols_padded // 4, 4)
-    swizzled = swizzled.permute(0, 3, 2, 1, 4).contiguous()
-    return swizzled.reshape(rows_padded, cols_padded)
-
-
-def _mxfp4_scales_to_flashinfer_w4a16(
-    scales: torch.Tensor,
-    *,
-    rows: int,
-    cols: int,
-) -> torch.Tensor:
-    if cols % 16 != 0:
-        raise ValueError(f"FlashInfer B12x W4A16 requires cols % 16 == 0, got {cols}")
-
-    scale_cols = scales.shape[-1]
-    if scales.dtype == torch.uint8:
-        scale_f32 = _e8m0_uint8_to_float32(scales)
-    else:
-        scale_f32 = scales.float()
-
-    if scale_cols == cols // 32:
-        scale_f32 = scale_f32.repeat_interleave(2, dim=-1)
-    elif scale_cols != cols // 16:
-        raise ValueError(
-            "FlashInfer B12x W4A16 expected MXFP4 scales with either "
-            f"{cols // 32} or {cols // 16} columns, got {scale_cols}."
-        )
-
-    finfo = torch.finfo(torch.float8_e4m3fn)
-    scale_f8 = torch.clamp(scale_f32, min=0.0, max=finfo.max).to(
-        torch.float8_e4m3fn
-    )
-    swizzled = [
-        _swizzle_flashinfer_w4a16_scales(scale_f8[e], rows, cols // 16)
-        for e in range(scale_f8.shape[0])
-    ]
-    return torch.stack(swizzled, dim=0).contiguous()
 
 
 def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
@@ -1225,8 +1133,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 ]:
     """Convert loaded weights into backend-specific kernel format.
 
-    Supports DeepGEMM, TRTLLM MXFP8, Triton, Marlin, and FlashInfer B12x
-    backends.
+    Supports DeepGEMM, TRTLLM MXFP8, Triton and Marlin backends.
     """
 
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
@@ -1280,45 +1187,6 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     hidden_size = w13_weight.shape[2] * 2
 
     sf_block_size = 32  # mxfp4 block size
-
-    if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16:
-        w13_weight = w13_weight.data
-        w2_weight = w2_weight.data
-        w13_weight_scale = w13_weight_scale.data
-        w2_weight_scale = w2_weight_scale.data
-
-        # FlashInfer W4A16 prepare expects [up, gate] source order and swaps it
-        # to the gate-first layout used by the SiLU kernel. vLLM stores [gate,
-        # up], so present the expected source order here.
-        w1_weight = w13_weight[:, :intermediate_size, :]
-        w3_weight = w13_weight[:, intermediate_size:, :]
-        w13_weight = torch.cat([w3_weight, w1_weight], dim=1).contiguous()
-
-        w1_scale = w13_weight_scale[:, :intermediate_size, :]
-        w3_scale = w13_weight_scale[:, intermediate_size:, :]
-        w13_weight_scale = torch.cat([w3_scale, w1_scale], dim=1).contiguous()
-
-        if w13_bias is not None:
-            b1 = w13_bias[:, :intermediate_size]
-            b3 = w13_bias[:, intermediate_size:]
-            w13_bias = torch.cat([b3, b1], dim=1).contiguous()
-
-        return (
-            w13_weight,
-            w2_weight.contiguous(),
-            _mxfp4_scales_to_flashinfer_w4a16(
-                w13_weight_scale,
-                rows=2 * intermediate_size,
-                cols=hidden_size,
-            ),
-            _mxfp4_scales_to_flashinfer_w4a16(
-                w2_weight_scale,
-                rows=hidden_size,
-                cols=intermediate_size,
-            ),
-            w13_bias,
-            w2_bias,
-        )
 
     if mxfp4_backend in TRTLLM_BACKENDS:
         assert _cache_permute_indices is not None
@@ -1629,7 +1497,6 @@ def make_mxfp4_moe_quant_config(
         Mxfp4MoeBackend.TRITON_UNFUSED,
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
-        Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16,
         Mxfp4MoeBackend.AITER_MXFP4_BF16,
     ):
         return mxfp4_w4a16_moe_quant_config(
@@ -1707,17 +1574,11 @@ def make_mxfp4_moe_kernel(
             **extra_kwargs,
         )
 
-    if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16:
-        assert layer is not None
-        experts.process_weights_after_loading(layer)
-
     kernel = mk.FusedMoEKernel(
         prepare_finalize,
         experts,
         inplace=(
-            not moe_config.disable_inplace
-            and mxfp4_backend not in TRTLLM_BACKENDS
-            and mxfp4_backend != Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16
+            not moe_config.disable_inplace and mxfp4_backend not in TRTLLM_BACKENDS
         ),
     )
 

@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """SM12x fallback implementations for DeepGEMM-only interfaces."""
 
-import os
-
 import torch
 
 from vllm.logger import init_logger
@@ -13,55 +11,6 @@ logger = init_logger(__name__)
 
 _SM120_MQA_LOGITS_MAX_SCORE_BYTES = 64 * 1024 * 1024
 _SM120_PAGED_MQA_TOPK_CHUNK_SIZE = 8192
-_SM120_MQA_TOPK_TRITON_MIN_ROWS = 64
-_SM120_MQA_TOPK_TRITON_MIN_ROWS_TOPK2048 = 128
-_SM120_MQA_TOPK_TRITON_MAX_ROWS = 256
-_SM120_MQA_TOPK_TRITON_MIN_KV_TOKENS = 8192
-
-
-def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        logger.warning("Ignoring invalid integer value for %s=%r", name, value)
-        return default
-
-
-def _use_triton_prefill_mqa_topk(
-    q_values: torch.Tensor,
-    k_values: torch.Tensor,
-    topk_indices: torch.Tensor,
-) -> bool:
-    if os.getenv("VLLM_SM12X_MQA_TOPK_TRITON", "0") != "1":
-        return False
-    min_rows = _env_int(
-        "VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS",
-        _SM120_MQA_TOPK_TRITON_MIN_ROWS,
-    )
-    min_kv_tokens = _env_int(
-        "VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS",
-        _SM120_MQA_TOPK_TRITON_MIN_KV_TOKENS,
-    )
-    max_rows = _env_int(
-        "VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS",
-        _SM120_MQA_TOPK_TRITON_MAX_ROWS,
-    )
-    row_count = q_values.shape[0]
-    topk_tokens = topk_indices.shape[1]
-    min_rows_for_topk = (
-        max(min_rows, _SM120_MQA_TOPK_TRITON_MIN_ROWS_TOPK2048)
-        if topk_tokens == 2048
-        else min_rows
-    )
-    return (
-        row_count >= min_rows_for_topk
-        and (max_rows <= 0 or row_count <= max_rows)
-        and k_values.shape[0] >= min_kv_tokens
-        and topk_tokens in (512, 2048)
-    )
 
 
 def _fp8_mqa_logits_head_chunk_size(
@@ -275,27 +224,6 @@ def fp8_fp4_mqa_topk_indices(
         and q[1] is None
     ):
         return False
-    if _use_triton_prefill_mqa_topk(q[0], kv[0], topk_indices):
-        from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
-            fp8_mqa_topk_indices_triton,
-        )
-
-        if fp8_mqa_topk_indices_triton(
-            q[0],
-            kv,
-            weights,
-            cu_seqlen_ks,
-            cu_seqlen_ke,
-            topk_indices,
-        ):
-            logger.warning_once(
-                "Using SM12x Triton prefill MQA top-k path "
-                "(q_rows=%s, kv_tokens=%s, topk=%s).",
-                q[0].shape[0],
-                kv[0].shape[0],
-                topk_indices.shape[1],
-            )
-            return True
     _fp8_mqa_logits_topk_torch(
         q,
         kv,

@@ -1242,28 +1242,7 @@ class FusedMoEKernelModularImpl:
         # to skip the redundant copy in TopKWeightAndReduceNoOP.apply downstream.
         # This eliminates ~94% of __amd_rocclr_copyBuffer events (Copy 2 of the
         # double-copy MoE write-back path).
-        can_alias_noop_output = False
-        try:
-            from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
-                TopKWeightAndReduceNoOP,
-            )
-
-            can_alias_noop_output = isinstance(
-                self.fused_experts.finalize_weight_and_reduce_impl(),
-                TopKWeightAndReduceNoOP,
-            )
-        except Exception:
-            can_alias_noop_output = False
-
-        if can_alias_noop_output and (
-            output_alias is not None
-            and output_alias.shape == fused_out.shape
-            and output_alias.dtype == fused_out.dtype
-            and output_alias.device == fused_out.device
-            and output_alias.is_contiguous()
-        ):
-            fused_out = output_alias
-        elif current_platform.is_rocm():
+        if current_platform.is_rocm():
             from vllm._aiter_ops import rocm_aiter_ops
 
             if (

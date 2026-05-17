@@ -1128,16 +1128,23 @@ def _accumulate_gathered_attention_chunk_kernel(
     running_denom = tl.load(denom_ptr + state_offset)
     running_acc = tl.load(acc_ptr + acc_offset, mask=dim_mask, other=0.0).to(tl.float32)
     valid_len = tl.load(lens_ptr + token_idx)
+    # Per-token early-loop-exit (see indexed kernel comment).
+    local_eff = tl.minimum(
+        num_candidates,
+        tl.maximum(valid_len - candidate_offset, 0),
+    )
 
-    # Keep this loop bound static so Triton can specialize/unroll the hot
-    # candidate loop; guard per-token tails inside the loop instead.
-    for candidate_idx in range(0, num_candidates):
-        is_valid = (candidate_offset + candidate_idx) < valid_len
+    # ``candidate_offset + candidate_idx < valid_len`` is structurally
+    # guaranteed by the ``local_eff`` cap above, so the only remaining
+    # gate is ``slot_id >= 0`` when slot ids are present.
+    for candidate_idx in range(0, local_eff):
         if HAS_SLOT_IDS:
             slot_id = tl.load(
                 slot_ids_ptr + token_idx * stride_slot_t + candidate_idx * stride_slot_c
             )
-            is_valid = is_valid & (slot_id >= 0)
+            is_valid = slot_id >= 0
+        else:
+            is_valid = True
 
         if is_valid:
             kv = tl.load(
@@ -1291,16 +1298,30 @@ def _accumulate_indexed_attention_chunk_kernel(
     running_denom = tl.load(denom_ptr + state_offset)
     running_acc = tl.load(acc_ptr + acc_offset, mask=dim_mask, other=0.0).to(tl.float32)
     valid_len = tl.load(lens_ptr + token_idx)
+    # Per-token early-loop-exit: the combine_topk_swa_indices kernel writes
+    # ``[topk_len_t | swa_len_t | -1 padding]`` and stores
+    # ``lens[t] = topk_len_t + swa_len_t``. The existing ``is_valid`` guard
+    # already gates the heavy work past ``valid_len``, but the outer loop
+    # still iterates the full ``num_candidates`` (= chunk width). Capping
+    # the loop at ``min(num_candidates, valid_len - candidate_offset)``
+    # saves the per-iteration index load + compare overhead on the dead
+    # tail. CUDA-graph-safe because ``lens_ptr`` is a stable address and
+    # the loaded value updates per call from the metadata builder.
+    local_eff = tl.minimum(
+        num_candidates,
+        tl.maximum(valid_len - candidate_offset, 0),
+    )
 
-    # Keep this loop bound static so Triton can specialize/unroll the hot
-    # candidate loop; guard per-token tails inside the loop instead.
-    for candidate_idx in range(0, num_candidates):
+    # ``candidate_offset + candidate_idx < valid_len`` is structurally
+    # guaranteed by the ``local_eff`` cap above; only the per-cell
+    # sentinel check (``kv_index >= 0``) is still meaningful.
+    for candidate_idx in range(0, local_eff):
         kv_index = tl.load(
             indices_ptr
             + token_idx * stride_indices_t
             + candidate_idx * stride_indices_c
         )
-        is_valid = ((candidate_offset + candidate_idx) < valid_len) & (kv_index >= 0)
+        is_valid = kv_index >= 0
 
         if is_valid:
             kv = tl.load(
@@ -1449,18 +1470,24 @@ def _accumulate_fp8ds_global_slots_attention_chunk_kernel(
     running_denom = tl.load(denom_ptr + state_offset)
     running_acc = tl.load(acc_ptr + acc_offset, mask=dim_mask, other=0.0).to(tl.float32)
     valid_len = tl.load(lens_ptr + token_idx)
+    # Per-token early-loop-exit (see indexed kernel comment).
+    local_eff = tl.minimum(
+        num_candidates,
+        tl.maximum(valid_len - candidate_offset, 0),
+    )
 
     fp8_mask = offsets < fp8_dim
     rope_mask = (offsets >= fp8_dim) & dim_mask
     rope_offsets = tl.maximum(offsets - fp8_dim, 0)
 
-    # Keep this loop bound static so Triton can specialize/unroll the hot
-    # candidate loop; guard per-token tails inside the loop instead.
-    for candidate_idx in range(0, num_candidates):
+    # ``candidate_offset + candidate_idx < valid_len`` is structurally
+    # guaranteed by the ``local_eff`` cap above; only the per-cell
+    # sentinel check (``slot_id >= 0``) is still meaningful.
+    for candidate_idx in range(0, local_eff):
         slot_id = tl.load(
             slot_ids_ptr + token_idx * stride_slot_t + candidate_idx * stride_slot_c
         )
-        is_valid = ((candidate_offset + candidate_idx) < valid_len) & (slot_id >= 0)
+        is_valid = slot_id >= 0
 
         if is_valid:
             block_idx = slot_id // cache_block_size
@@ -1651,18 +1678,28 @@ def _accumulate_fp8ds_global_slots_attention_chunk_multihead_kernel(
         tl.float32
     )
     valid_len = tl.load(lens_ptr + token_idx)
+    # Per-token early-loop-exit: ``lens[t] = topk_len_t + swa_len_t`` (set
+    # by combine_topk_swa_indices). Iterating past ``valid_len`` only
+    # incurs the per-iter index-load + compare cost on padding-tail; cap
+    # the outer loop at ``valid_len - candidate_offset`` to skip the dead
+    # tail. CUDA-graph-safe because ``lens_ptr`` is a stable address.
+    local_eff = tl.minimum(
+        num_candidates,
+        tl.maximum(valid_len - candidate_offset, 0),
+    )
 
     fp8_mask = dim_offsets < fp8_dim
     rope_mask = (dim_offsets >= fp8_dim) & dim_mask
     rope_offsets = tl.maximum(dim_offsets - fp8_dim, 0)
 
-    # Keep this loop bound static so Triton can specialize/unroll the hot
-    # candidate loop; guard per-token tails inside the loop instead.
-    for candidate_idx in range(0, num_candidates):
+    # ``candidate_offset + candidate_idx < valid_len`` is structurally
+    # guaranteed by the ``local_eff`` cap above; only the per-cell
+    # sentinel check (``slot_id >= 0``) is still meaningful.
+    for candidate_idx in range(0, local_eff):
         slot_id = tl.load(
             slot_ids_ptr + token_idx * stride_slot_t + candidate_idx * stride_slot_c
         )
-        is_valid = ((candidate_offset + candidate_idx) < valid_len) & (slot_id >= 0)
+        is_valid = slot_id >= 0
 
         if is_valid:
             block_idx = slot_id // cache_block_size
@@ -1859,53 +1896,56 @@ def _accumulate_fp8ds_paged_attention_chunk_kernel(
     fp8_mask = offsets < fp8_dim
     rope_mask = (offsets >= fp8_dim) & dim_mask
     rope_offsets = tl.maximum(offsets - fp8_dim, 0)
-    # Keep this loop bound static so Triton can specialize/unroll the hot
-    # candidate loop; guard per-token tails inside the loop instead.
-    for candidate_idx in range(0, num_candidates):
+    # Per-token early-loop-exit (see indexed kernel comment).
+    local_eff = tl.minimum(
+        num_candidates,
+        tl.maximum(gather_len - candidate_offset, 0),
+    )
+
+    # ``gather_idx < gather_len`` is structurally guaranteed by the
+    # ``local_eff`` cap above; the body is unconditional.
+    for candidate_idx in range(0, local_eff):
         gather_idx = candidate_offset + candidate_idx
-        is_valid = gather_idx < gather_len
+        pos = start_pos + gather_idx
+        block_in_seq = pos // cache_block_size
+        pos_in_block = pos % cache_block_size
+        physical_block = tl.load(
+            block_table_ptr + token_idx * stride_block_table_t + block_in_seq
+        )
+        cache_block_ptr = k_cache_ptr + physical_block.to(tl.int64) * block_stride
+        token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+        token_scale_ptr = (
+            cache_block_ptr
+            + cache_block_size * token_data_size
+            + pos_in_block * scale_dim
+        )
 
-        if is_valid:
-            pos = start_pos + gather_idx
-            block_in_seq = pos // cache_block_size
-            pos_in_block = pos % cache_block_size
-            physical_block = tl.load(
-                block_table_ptr + token_idx * stride_block_table_t + block_in_seq
-            )
-            cache_block_ptr = k_cache_ptr + physical_block.to(tl.int64) * block_stride
-            token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
-            token_scale_ptr = (
-                cache_block_ptr
-                + cache_block_size * token_data_size
-                + pos_in_block * scale_dim
-            )
+        x_uint8 = tl.load(token_data_ptr + offsets, mask=fp8_mask, other=0)
+        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+        x_float = x_fp8.to(tl.float32)
+        scale_offsets = offsets // quant_block
+        encoded_scale = tl.load(
+            token_scale_ptr + scale_offsets,
+            mask=fp8_mask,
+            other=127,
+        )
+        dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+        x_dequant = x_float * dequant_scale
 
-            x_uint8 = tl.load(token_data_ptr + offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
-            scale_offsets = offsets // quant_block
-            encoded_scale = tl.load(
-                token_scale_ptr + scale_offsets,
-                mask=fp8_mask,
-                other=127,
-            )
-            dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
-            x_dequant = x_float * dequant_scale
+        rope_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+        rope = tl.load(rope_ptr + rope_offsets, mask=rope_mask, other=0.0).to(
+            tl.float32
+        )
+        kv = tl.where(fp8_mask, x_dequant, rope)
+        kv = tl.where(dim_mask, kv, 0.0)
 
-            rope_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
-            rope = tl.load(rope_ptr + rope_offsets, mask=rope_mask, other=0.0).to(
-                tl.float32
-            )
-            kv = tl.where(fp8_mask, x_dequant, rope)
-            kv = tl.where(dim_mask, kv, 0.0)
-
-            score = tl.sum(q * kv, axis=0) * scale
-            next_max = tl.maximum(running_max, score)
-            previous_weight = tl.exp(running_max - next_max)
-            candidate_weight = tl.exp(score - next_max)
-            running_acc = running_acc * previous_weight + kv * candidate_weight
-            running_denom = running_denom * previous_weight + candidate_weight
-            running_max = next_max
+        score = tl.sum(q * kv, axis=0) * scale
+        next_max = tl.maximum(running_max, score)
+        previous_weight = tl.exp(running_max - next_max)
+        candidate_weight = tl.exp(score - next_max)
+        running_acc = running_acc * previous_weight + kv * candidate_weight
+        running_denom = running_denom * previous_weight + candidate_weight
+        running_max = next_max
 
     tl.store(max_score_ptr + state_offset, running_max)
     tl.store(denom_ptr + state_offset, running_denom)
@@ -2063,56 +2103,63 @@ def _accumulate_fp8ds_paged_attention_chunk_multihead_kernel(
     fp8_mask = dim_offsets < fp8_dim
     rope_mask = (dim_offsets >= fp8_dim) & dim_mask
     rope_offsets = tl.maximum(dim_offsets - fp8_dim, 0)
-    # Keep this loop bound static so Triton can specialize/unroll the hot
-    # candidate loop; guard per-token tails inside the loop instead.
-    for candidate_idx in range(0, num_candidates):
+    # Per-token early-loop-exit: ``gather_len`` is the per-token count of
+    # cached entries available for this paged read; the existing
+    # ``is_valid`` guard skips heavy work past that, but we can also skip
+    # the per-iter index load + branch by capping the loop. CUDA-graph-
+    # safe because ``gather_lens_ptr`` is a stable address.
+    local_eff = tl.minimum(
+        num_candidates,
+        tl.maximum(gather_len - candidate_offset, 0),
+    )
+
+    # ``gather_idx < gather_len`` is structurally guaranteed by the
+    # ``local_eff`` cap above; the body is unconditional.
+    for candidate_idx in range(0, local_eff):
         gather_idx = candidate_offset + candidate_idx
-        is_valid = gather_idx < gather_len
+        pos = start_pos + gather_idx
+        block_in_seq = pos // cache_block_size
+        pos_in_block = pos % cache_block_size
+        physical_block = tl.load(
+            block_table_ptr + token_idx * stride_block_table_t + block_in_seq
+        )
+        cache_block_ptr = k_cache_ptr + physical_block.to(tl.int64) * block_stride
+        token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+        token_scale_ptr = (
+            cache_block_ptr
+            + cache_block_size * token_data_size
+            + pos_in_block * scale_dim
+        )
 
-        if is_valid:
-            pos = start_pos + gather_idx
-            block_in_seq = pos // cache_block_size
-            pos_in_block = pos % cache_block_size
-            physical_block = tl.load(
-                block_table_ptr + token_idx * stride_block_table_t + block_in_seq
-            )
-            cache_block_ptr = k_cache_ptr + physical_block.to(tl.int64) * block_stride
-            token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
-            token_scale_ptr = (
-                cache_block_ptr
-                + cache_block_size * token_data_size
-                + pos_in_block * scale_dim
-            )
+        x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
+        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+        x_float = x_fp8.to(tl.float32)
+        scale_offsets = dim_offsets // quant_block
+        encoded_scale = tl.load(
+            token_scale_ptr + scale_offsets,
+            mask=fp8_mask,
+            other=127,
+        )
+        dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+        x_dequant = x_float * dequant_scale
 
-            x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
-            scale_offsets = dim_offsets // quant_block
-            encoded_scale = tl.load(
-                token_scale_ptr + scale_offsets,
-                mask=fp8_mask,
-                other=127,
-            )
-            dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
-            x_dequant = x_float * dequant_scale
+        rope_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+        rope = tl.load(rope_ptr + rope_offsets, mask=rope_mask, other=0.0).to(
+            tl.float32
+        )
+        kv = tl.where(fp8_mask, x_dequant, rope)
+        kv = tl.where(dim_mask, kv, 0.0)
 
-            rope_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
-            rope = tl.load(rope_ptr + rope_offsets, mask=rope_mask, other=0.0).to(
-                tl.float32
-            )
-            kv = tl.where(fp8_mask, x_dequant, rope)
-            kv = tl.where(dim_mask, kv, 0.0)
-
-            score = tl.sum(q * kv[None, :], axis=1) * scale
-            next_max = tl.maximum(running_max, score)
-            previous_weight = tl.exp(running_max - next_max)
-            candidate_weight = tl.exp(score - next_max)
-            running_acc = (
-                running_acc * previous_weight[:, None]
-                + kv[None, :] * candidate_weight[:, None]
-            )
-            running_denom = running_denom * previous_weight + candidate_weight
-            running_max = next_max
+        score = tl.sum(q * kv[None, :], axis=1) * scale
+        next_max = tl.maximum(running_max, score)
+        previous_weight = tl.exp(running_max - next_max)
+        candidate_weight = tl.exp(score - next_max)
+        running_acc = (
+            running_acc * previous_weight[:, None]
+            + kv[None, :] * candidate_weight[:, None]
+        )
+        running_denom = running_denom * previous_weight + candidate_weight
+        running_max = next_max
 
     tl.store(max_score_ptr + state_offsets, running_max, mask=head_mask)
     tl.store(denom_ptr + state_offsets, running_denom, mask=head_mask)
@@ -2257,56 +2304,63 @@ def _fp8ds_paged_attention_with_sink_multihead_kernel(
     fp8_mask = dim_offsets < fp8_dim
     rope_mask = (dim_offsets >= fp8_dim) & dim_mask
     rope_offsets = tl.maximum(dim_offsets - fp8_dim, 0)
-    # Keep this loop bound static so Triton can specialize/unroll the hot
-    # candidate loop; guard per-token tails inside the loop instead.
-    for candidate_idx in range(0, num_candidates):
+    # Per-token early-loop-exit: ``gather_len`` is the per-token count of
+    # cached entries available for this paged read; the existing
+    # ``is_valid`` guard skips heavy work past that, but we can also skip
+    # the per-iter index load + branch by capping the loop. CUDA-graph-
+    # safe because ``gather_lens_ptr`` is a stable address.
+    local_eff = tl.minimum(
+        num_candidates,
+        tl.maximum(gather_len - candidate_offset, 0),
+    )
+
+    # ``gather_idx < gather_len`` is structurally guaranteed by the
+    # ``local_eff`` cap above; the body is unconditional.
+    for candidate_idx in range(0, local_eff):
         gather_idx = candidate_offset + candidate_idx
-        is_valid = gather_idx < gather_len
+        pos = start_pos + gather_idx
+        block_in_seq = pos // cache_block_size
+        pos_in_block = pos % cache_block_size
+        physical_block = tl.load(
+            block_table_ptr + token_idx * stride_block_table_t + block_in_seq
+        )
+        cache_block_ptr = k_cache_ptr + physical_block.to(tl.int64) * block_stride
+        token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
+        token_scale_ptr = (
+            cache_block_ptr
+            + cache_block_size * token_data_size
+            + pos_in_block * scale_dim
+        )
 
-        if is_valid:
-            pos = start_pos + gather_idx
-            block_in_seq = pos // cache_block_size
-            pos_in_block = pos % cache_block_size
-            physical_block = tl.load(
-                block_table_ptr + token_idx * stride_block_table_t + block_in_seq
-            )
-            cache_block_ptr = k_cache_ptr + physical_block.to(tl.int64) * block_stride
-            token_data_ptr = cache_block_ptr + pos_in_block * token_data_size
-            token_scale_ptr = (
-                cache_block_ptr
-                + cache_block_size * token_data_size
-                + pos_in_block * scale_dim
-            )
+        x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
+        x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
+        x_float = x_fp8.to(tl.float32)
+        scale_offsets = dim_offsets // quant_block
+        encoded_scale = tl.load(
+            token_scale_ptr + scale_offsets,
+            mask=fp8_mask,
+            other=127,
+        )
+        dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+        x_dequant = x_float * dequant_scale
 
-            x_uint8 = tl.load(token_data_ptr + dim_offsets, mask=fp8_mask, other=0)
-            x_fp8 = x_uint8.to(tl.float8e4nv, bitcast=True)
-            x_float = x_fp8.to(tl.float32)
-            scale_offsets = dim_offsets // quant_block
-            encoded_scale = tl.load(
-                token_scale_ptr + scale_offsets,
-                mask=fp8_mask,
-                other=127,
-            )
-            dequant_scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
-            x_dequant = x_float * dequant_scale
+        rope_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
+        rope = tl.load(rope_ptr + rope_offsets, mask=rope_mask, other=0.0).to(
+            tl.float32
+        )
+        kv = tl.where(fp8_mask, x_dequant, rope)
+        kv = tl.where(dim_mask, kv, 0.0)
 
-            rope_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
-            rope = tl.load(rope_ptr + rope_offsets, mask=rope_mask, other=0.0).to(
-                tl.float32
-            )
-            kv = tl.where(fp8_mask, x_dequant, rope)
-            kv = tl.where(dim_mask, kv, 0.0)
-
-            score = tl.sum(q * kv[None, :], axis=1) * scale
-            next_max = tl.maximum(running_max, score)
-            previous_weight = tl.exp(running_max - next_max)
-            candidate_weight = tl.exp(score - next_max)
-            running_acc = (
-                running_acc * previous_weight[:, None]
-                + kv[None, :] * candidate_weight[:, None]
-            )
-            running_denom = running_denom * previous_weight + candidate_weight
-            running_max = next_max
+        score = tl.sum(q * kv[None, :], axis=1) * scale
+        next_max = tl.maximum(running_max, score)
+        previous_weight = tl.exp(running_max - next_max)
+        candidate_weight = tl.exp(score - next_max)
+        running_acc = (
+            running_acc * previous_weight[:, None]
+            + kv[None, :] * candidate_weight[:, None]
+        )
+        running_denom = running_denom * previous_weight + candidate_weight
+        running_max = next_max
 
     sink = tl.load(sink_ptr + head_offsets, mask=head_mask, other=-float("inf"))
     has_tokens = running_denom > 0.0

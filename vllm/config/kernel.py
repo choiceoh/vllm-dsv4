@@ -127,7 +127,6 @@ MoEBackend = Literal[
     "cutlass",
     "flashinfer_trtllm",
     "flashinfer_cutlass",
-    "flashinfer_b12x",
     "flashinfer_cutedsl",
     "marlin",
     "humming",
@@ -160,7 +159,6 @@ class KernelConfig:
     - "cutlass": Use vLLM CUTLASS kernels
     - "flashinfer_trtllm": Use FlashInfer with TRTLLM-GEN kernels
     - "flashinfer_cutlass": Use FlashInfer with CUTLASS kernels
-    - "flashinfer_b12x": Use FlashInfer B12x SM12x kernels
     - "flashinfer_cutedsl": Use FlashInfer with CuteDSL kernels (FP4 only)
     - "marlin": Use Marlin kernels (weight-only quantization)
     - "humming": Use Humming Mixed Precision kernels

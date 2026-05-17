@@ -176,10 +176,6 @@ if TYPE_CHECKING:
     VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
     VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_SPLITKV_DECODE: bool = False
-    VLLM_SM12X_MQA_TOPK_TRITON: bool = False
-    VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS: int = 64
-    VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: int = 256
-    VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: int = 8192
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -229,7 +225,6 @@ if TYPE_CHECKING:
     VLLM_HAS_FLASHINFER_CUBIN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
-    VLLM_USE_FLASHINFER_MOE_B12X_W4A16: bool = False
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
@@ -1343,18 +1338,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TRITON_MLA_SPARSE_SPLITKV_DECODE": lambda: bool(
         int(os.getenv("VLLM_TRITON_MLA_SPARSE_SPLITKV_DECODE", "0"))
     ),
-    "VLLM_SM12X_MQA_TOPK_TRITON": lambda: bool(
-        int(os.getenv("VLLM_SM12X_MQA_TOPK_TRITON", "0"))
-    ),
-    "VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS": lambda: int(
-        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS", "64")
-    ),
-    "VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS": lambda: int(
-        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS", "256")
-    ),
-    "VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS": lambda: int(
-        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS", "8192")
-    ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
     # JIT'ing in the hot-path. However, this warmup increases the engine
@@ -1416,11 +1399,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # BF16 (activation) x MXFP4 (weight) MoE backend.
     "VLLM_USE_FLASHINFER_MOE_MXFP4_BF16": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_MXFP4_BF16", "0"))
-    ),
-    # If set to 1, use the FlashInfer B12x SM12x W4A16
-    # BF16 (activation) x MXFP4 (weight) MoE backend.
-    "VLLM_USE_FLASHINFER_MOE_B12X_W4A16": lambda: bool(
-        int(os.getenv("VLLM_USE_FLASHINFER_MOE_B12X_W4A16", "0"))
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
