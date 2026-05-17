@@ -20,6 +20,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     ToolCall,
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+from vllm.envs import VLLM_ENFORCE_STRICT_TOOL_CALLING
 from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
@@ -32,6 +33,8 @@ logger = init_logger(__name__)
 
 
 class DeepSeekV32ToolParser(ToolParser):
+    supports_required_and_named: bool = not VLLM_ENFORCE_STRICT_TOOL_CALLING
+
     """
     example tool call content:
     <｜DSML｜function_calls>
