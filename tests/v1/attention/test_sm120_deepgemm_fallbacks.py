@@ -214,6 +214,58 @@ def test_sm120_triton_prefill_mqa_topk_gate_uses_row_band(
     )
 
 
+def test_sm120_triton_prefill_mqa_topk_stream_tile_guard(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
+        _fp8_mqa_topk_stream_k_tiles_per_launch,
+    )
+
+    monkeypatch.delenv("VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES", raising=False)
+    assert _fp8_mqa_topk_stream_k_tiles_per_launch(131072, 2048) == 1
+
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES", "2")
+    assert _fp8_mqa_topk_stream_k_tiles_per_launch(8192, 2048) == 1
+    assert _fp8_mqa_topk_stream_k_tiles_per_launch(32000, 512) == 2
+    assert _fp8_mqa_topk_stream_k_tiles_per_launch(131072, 2048) == 2
+
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS", "131072")
+    assert _fp8_mqa_topk_stream_k_tiles_per_launch(131072, 2048) == 1
+
+
+def test_triton_sparse_mla_prefill_topk_chunk_guard(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.backends.mla.sparse_mla_env import (
+        triton_sparse_mla_prefill_topk_chunk_size,
+    )
+
+    monkeypatch.delenv(
+        "VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_MIN_TOKENS",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "vllm.envs.VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE",
+        512,
+    )
+    assert triton_sparse_mla_prefill_topk_chunk_size(8192, 1024) == 512
+
+    monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE", "1024")
+    assert triton_sparse_mla_prefill_topk_chunk_size(4096, 1024) == 512
+    assert triton_sparse_mla_prefill_topk_chunk_size(8192, 1024) == 1024
+    assert triton_sparse_mla_prefill_topk_chunk_size(8192, 768) == 768
+
+    monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_MIN_TOKENS", "1")
+    assert triton_sparse_mla_prefill_topk_chunk_size(4096, 1024) == 1024
+
+    monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE", "bad")
+    assert triton_sparse_mla_prefill_topk_chunk_size(8192, 1024) == 512
+
+
 def test_sm120_triton_prefill_mqa_topk_rejects_cpu_without_mutation():
     from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
         fp8_mqa_topk_indices_triton,

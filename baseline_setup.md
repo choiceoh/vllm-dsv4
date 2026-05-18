@@ -1,4 +1,4 @@
-# DeepSeek V4 Flash GB10 Baseline Setup
+# DeepSeek V4 Flash GB10 Combined Prefill Baseline Setup
 
 This baseline captures the working two-node GB10 setup validated on
 2026-05-18. It is meant to be a stable starting image for future agents so they
@@ -7,10 +7,8 @@ can build one baseline image and then layer experiments on top of that image.
 ## What This Baseline Contains
 
 - vLLM branch: `production-baseline-20260515`
-- vLLM source savepoint: `979289d09 sm12x: save static MLA top-k tiling experiment`
-- Baseline docs/checkpoint commit: the commit that contains this file descends
-  from `979289d09`; no vLLM runtime code should change after that savepoint
-  unless intentionally creating a new baseline.
+- vLLM source savepoint: the commit that contains this file, descending from
+  `5b5b63ded docs: checkpoint flashinfer static mla baseline`
 - FlashInfer checkout: `/home/aidendle94/Documents/workspace/flashinfer-latest`
 - FlashInfer branch: `pr-3336-w4a16-rewrite`
 - FlashInfer commit: `a52ad3a649ab3716efe738be24e837566117d2b3`
@@ -19,20 +17,25 @@ can build one baseline image and then layer experiments on top of that image.
 - Context shape: `max_model_len=131072`, `max_num_batched_tokens=8192`, `max_num_seqs=1`
 - MoE backend: `FLASHINFER_B12X_MXFP4_BF16`
 - Static MLA/MQA path: `VLLM_SM12X_MQA_TOPK_TRITON=1`
+- Combined prefill opts:
+  `VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES=2` and
+  `VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE=1024`
 
-The validated 128k C=1 result for this setup was:
+The validated warm measured results for this setup were:
 
-- Request: 128,000 prompt token IDs, 128 output tokens
-- Prefix cache hits: `0`
-- Server prefill: `507.05 tok/s`
-- Server decode: `34.32 tok/s`
-- Client TTFT: `252.57 s`
-- Client total wall time: `256.27 s`
+- 32k request: `466.81 tok/s` server prefill, `40.17 tok/s` server decode
+- 128k request: `515.77 tok/s` server prefill, `33.76 tok/s` server decode
+- Prefix cache hits: `0` for every warmup and measured leg
 
-The full benchmark artifact is:
+Compared to the same patched image with the new knobs off:
+
+- 32k measured prefill: `+1.91%`; decode: `+2.15%`
+- 128k measured prefill: `+3.68%`; decode: `+1.00%`
+
+The full A/B artifact is:
 
 ```text
-/home/aidendle94/Documents/workspace/experiment_runs/flashinfer_static_mla_128k_20260518T014440Z/report.md
+/home/aidendle94/Documents/workspace/experiment_runs/ab_compare_combined_prefill_opts_20260518T065955Z/report.md
 ```
 
 ## Build The Baseline Image
@@ -46,9 +49,10 @@ set -euo pipefail
 export WORKSPACE=/home/aidendle94/Documents/workspace
 export VLLM_ROOT=${WORKSPACE}/vllm
 export BASE_IMAGE=sparkrun-vllm-ds4-gb10:ae353d502-static-mla-dirty-20260518T000139Z-cuda13.2-nccl2.30-vllm-openai-base
-export BASELINE_IMAGE=sparkrun-vllm-ds4-gb10:979289d-flashinfer-static-mla-baseline-cuda13.2-nccl2.30-vllm-openai-base
+export BASELINE_REF=$(git -C "${VLLM_ROOT}" rev-parse --short HEAD)
+export BASELINE_IMAGE=sparkrun-vllm-ds4-gb10:${BASELINE_REF}-combined-prefill-baseline-cuda13.2-nccl2.30-vllm-openai-base
 
-git -C "${VLLM_ROOT}" merge-base --is-ancestor 979289d09 HEAD
+git -C "${VLLM_ROOT}" merge-base --is-ancestor 5b5b63ded HEAD
 test "$(git -C "${WORKSPACE}/flashinfer-latest" rev-parse HEAD)" = "a52ad3a649ab3716efe738be24e837566117d2b3"
 
 DOCKER_BUILDKIT=1 docker build \
@@ -75,11 +79,11 @@ only when intentionally testing a descendant image.
 
 ```yaml
 recipe_version: "1"
-name: DeepSeek V4 Flash GB10 FlashInfer static MLA baseline
-description: DeepSeek V4 Flash GB10 baseline with FlashInfer B12x W4A16, static SM12x MQA top-k, MTP=2, and 128k context.
+name: DeepSeek V4 Flash GB10 combined prefill baseline
+description: DeepSeek V4 Flash GB10 baseline with FlashInfer B12x W4A16, static SM12x MQA top-k, combined prefill opts, MTP=2, and 128k context.
 runtime: vllm-distributed
 model: deepseek-ai/DeepSeek-V4-Flash
-container: sparkrun-vllm-ds4-gb10:979289d-flashinfer-static-mla-baseline-cuda13.2-nccl2.30-vllm-openai-base
+container: sparkrun-vllm-ds4-gb10:<commit>-combined-prefill-baseline-cuda13.2-nccl2.30-vllm-openai-base
 cluster_only: true
 min_nodes: 2
 max_nodes: 2
@@ -105,8 +109,10 @@ env:
   VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS: "64"
   VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: "256"
   VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: "8192"
+  VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES: "2"
   VLLM_TRITON_MLA_SPARSE: "1"
   VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: "1024"
+  VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE: "1024"
   VLLM_MARLIN_USE_ATOMIC_ADD: "1"
   VLLM_NCCL_SO_PATH: /usr/lib/aarch64-linux-gnu/libnccl.so.2
   NCCL_IB_DISABLE: "0"
@@ -131,7 +137,6 @@ command: |
     --no-enable-flashinfer-autotune \
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
     --speculative-config '{"method":"deepseek_mtp","num_speculative_tokens":2}' \
-    --profiler-config '{"profiler":"torch","torch_profiler_dir":"/tmp/vllm_torch_profile/current_static_mla_128k","torch_profiler_with_stack":false,"torch_profiler_record_shapes":false,"torch_profiler_with_memory":false,"torch_profiler_use_gzip":true,"ignore_frontend":true}' \
     --tokenizer-mode deepseek_v4 \
     --tool-call-parser deepseek_v4 \
     --enable-auto-tool-choice \
@@ -143,16 +148,16 @@ Launch it:
 
 ```bash
 cd /home/aidendle94/Documents/workspace/vllm-ds4-sm120-harness
-sparkrun run /tmp/deepseek-v4-flash-gb10-flashinfer-static-mla-baseline.yaml --no-follow
+sparkrun run /tmp/deepseek-v4-flash-gb10-combined-prefill-baseline.yaml --no-follow
 ```
 
-If reusing the checked harness recipe from the validation run, override only the
-image:
+If reusing an older checked harness recipe, make sure it includes the two
+combined-prefill env vars above and remove any `--profiler-config` unless you
+are intentionally taking a profile. The old static-MLA profile recipe is not the
+clean throughput baseline by itself.
 
 ```bash
-sparkrun run sparkrun/deepseek-v4-flash-gb10-current-static-mla-128k-profile.yaml \
-  --image "${BASELINE_IMAGE}" \
-  --no-follow
+rg "STREAM_K_TILES|PREFILL_TOPK_CHUNK|profiler-config" sparkrun/*.yaml
 ```
 
 ## Validation
@@ -178,6 +183,11 @@ Using 'FLASHINFER_B12X_MXFP4_BF16' Mxfp4 MoE backend.
 Using SM12x Triton prefill MQA top-k path (... row_tile=256 ...)
 GET /health HTTP/1.1" 200 OK
 ```
+
+The first long request may still show a Triton JIT warning for
+`_fp8_mqa_topk_stream_kernel` if that exact stream-grouped shape was not covered
+by warmup. Treat the second request at the same context length as the warm
+measurement.
 
 For the 128k benchmark, use an uncached single request with 128,000 prompt token
 IDs and 128 output tokens, then compute throughput from Prometheus metric

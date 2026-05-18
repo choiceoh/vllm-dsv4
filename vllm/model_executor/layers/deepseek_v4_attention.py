@@ -79,6 +79,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_triton_sparse_mla_enabled,
     is_triton_sparse_mla_enabled_for_platform,
     triton_sparse_mla_matmul_decode_enabled,
+    triton_sparse_mla_prefill_topk_chunk_size,
     triton_sparse_mla_query_chunk_size,
     triton_sparse_mla_splitkv_decode_enabled,
     triton_sparse_mla_topk_chunk_size,
@@ -1182,7 +1183,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         kv_flat = kv.reshape(-1, q.shape[-1])
         topk_chunk_size = min(
             combined_indices.shape[-1],
-            triton_sparse_mla_topk_chunk_size(),
+            triton_sparse_mla_prefill_topk_chunk_size(
+                q.shape[0],
+                combined_indices.shape[-1],
+            ),
         )
         query_chunk_size = min(
             q.shape[0],

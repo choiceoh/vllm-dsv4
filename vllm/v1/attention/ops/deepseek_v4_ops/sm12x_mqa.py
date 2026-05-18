@@ -2,9 +2,37 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Triton fallback kernels used by the local DeepSeek V4 path."""
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
+
+_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS = 8192
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+def _fp8_mqa_topk_stream_k_tiles_per_launch(seq_len_kv: int, topk: int) -> int:
+    requested = _env_int("VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES", 1)
+    if requested <= 1:
+        return 1
+
+    min_kv_tokens = _env_int(
+        "VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS",
+        _SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS,
+    )
+    if seq_len_kv < max(topk * 16, min_kv_tokens * 2):
+        return 1
+    return min(requested, 2)
 
 
 def _view_packed_fp8_paged_mqa_kv_cache(
@@ -204,107 +232,112 @@ def _fp8_mqa_topk_stream_kernel(
     stride_bk: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_H: tl.constexpr,
+    K_TILES_PER_LAUNCH: tl.constexpr,
 ):
     row = tl.program_id(0)
     offs_k = tl.arange(0, topk)
-    offs_n = tile_start + offs_k
     offs_d = tl.arange(0, BLOCK_D)
 
     valid_row = row < num_q
     seq_start = tl.load(cu_seqlen_ks_ptr + row, mask=valid_row, other=0)
     seq_end = tl.load(cu_seqlen_ke_ptr + row, mask=valid_row, other=0)
-    valid_n = (offs_n < seq_len_kv) & (offs_n >= seq_start) & (offs_n < seq_end)
-
-    logits = tl.zeros((topk,), dtype=tl.float32)
-    scale = tl.load(scale_ptr + offs_n, mask=valid_n, other=0.0)
-
-    for h0 in tl.range(0, num_heads, BLOCK_H):
-        heads = h0 + tl.arange(0, BLOCK_H)
-        valid_h = heads < num_heads
-        scores = tl.zeros((BLOCK_H, topk), dtype=tl.float32)
-        for d0 in tl.range(0, head_dim, BLOCK_D):
-            d = d0 + offs_d
-            q = tl.load(
-                q_ptr
-                + row * stride_qm
-                + heads[:, None] * stride_qh
-                + d[None, :] * stride_qd,
-                mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
-            k = tl.load(
-                k_ptr + offs_n[None, :] * stride_kn + d[:, None] * stride_kd,
-                mask=valid_n[None, :] & (d[:, None] < head_dim),
-                other=0.0,
-            ).to(tl.float32)
-            scores += tl.dot(q, k, input_precision="tf32")
-
-        weighted = tl.maximum(scores * scale[None, :], 0.0)
-        weight = tl.load(
-            weights_ptr + row * stride_wm + heads * stride_wh,
-            mask=valid_row & valid_h,
-            other=0.0,
-        )
-        logits += tl.sum(weighted * weight[:, None], axis=0)
-
-    logits = tl.where(valid_row & valid_n, logits, -float("inf"))
-
-    prev_values = tl.load(
-        best_values_ptr + row * stride_bm + offs_k * stride_bk,
-        mask=valid_row,
-        other=-float("inf"),
-    )
-    prev_indices = tl.load(
-        best_indices_ptr + row * stride_bm + offs_k * stride_bk,
-        mask=valid_row,
-        other=-1,
-    )
-    prev_valid = valid_row & (prev_indices >= 0)
 
     min_i32: tl.constexpr = -2147483648
     invalid_key: tl.constexpr = 2147483647
-
-    prev_bits = prev_values.to(tl.int32, bitcast=True)
-    prev_sign = prev_bits >> 31
-    prev_key = tl.where(prev_sign == 0, prev_bits ^ -1, prev_bits ^ min_i32)
-    prev_key = tl.where(prev_valid, prev_key, invalid_key)
-    prev_packed = ((prev_key.to(tl.int64) & 0xFFFFFFFF) << 32) | (
-        prev_indices.to(tl.int64) & 0xFFFFFFFF
-    )
-
-    tile_bits = logits.to(tl.int32, bitcast=True)
-    tile_sign = tile_bits >> 31
-    tile_key = tl.where(tile_sign == 0, tile_bits ^ -1, tile_bits ^ min_i32)
-    tile_key = tl.where(valid_row & valid_n, tile_key, invalid_key)
-    tile_packed = ((tile_key.to(tl.int64) & 0xFFFFFFFF) << 32) | (
-        offs_n.to(tl.int64) & 0xFFFFFFFF
-    )
-
-    merged = tl.interleave(prev_packed, tile_packed)
-    sorted_merged = tl.sort(merged, descending=False)
-
     offs_merged = tl.arange(0, topk * 2)
-    sorted_key = ((sorted_merged >> 32) & 0xFFFFFFFF).to(tl.int32)
-    sorted_index = (sorted_merged & 0xFFFFFFFF).to(tl.int32)
-    sorted_valid = sorted_key != invalid_key
 
-    sorted_sign = sorted_key >> 31
-    sorted_bits = tl.where(sorted_sign < 0, sorted_key ^ -1, sorted_key ^ min_i32)
-    sorted_values = sorted_bits.to(tl.float32, bitcast=True)
-    sorted_values = tl.where(sorted_valid, sorted_values, -float("inf"))
-    sorted_index = tl.where(sorted_valid, sorted_index, -1)
+    for tile_i in tl.static_range(0, K_TILES_PER_LAUNCH):
+        offs_n = tile_start + tile_i * topk + offs_k
+        valid_n = (offs_n < seq_len_kv) & (offs_n >= seq_start) & (
+            offs_n < seq_end
+        )
 
-    store_mask = valid_row & (offs_merged < topk)
-    tl.store(
-        best_values_ptr + row * stride_bm + offs_merged * stride_bk,
-        sorted_values,
-        mask=store_mask,
-    )
-    tl.store(
-        best_indices_ptr + row * stride_bm + offs_merged * stride_bk,
-        sorted_index,
-        mask=store_mask,
-    )
+        logits = tl.zeros((topk,), dtype=tl.float32)
+        scale = tl.load(scale_ptr + offs_n, mask=valid_n, other=0.0)
+
+        for h0 in tl.range(0, num_heads, BLOCK_H):
+            heads = h0 + tl.arange(0, BLOCK_H)
+            valid_h = heads < num_heads
+            scores = tl.zeros((BLOCK_H, topk), dtype=tl.float32)
+            for d0 in tl.range(0, head_dim, BLOCK_D):
+                d = d0 + offs_d
+                q = tl.load(
+                    q_ptr
+                    + row * stride_qm
+                    + heads[:, None] * stride_qh
+                    + d[None, :] * stride_qd,
+                    mask=valid_row & valid_h[:, None] & (d[None, :] < head_dim),
+                    other=0.0,
+                ).to(tl.float32)
+                k = tl.load(
+                    k_ptr + offs_n[None, :] * stride_kn + d[:, None] * stride_kd,
+                    mask=valid_n[None, :] & (d[:, None] < head_dim),
+                    other=0.0,
+                ).to(tl.float32)
+                scores += tl.dot(q, k, input_precision="tf32")
+
+            weighted = tl.maximum(scores * scale[None, :], 0.0)
+            weight = tl.load(
+                weights_ptr + row * stride_wm + heads * stride_wh,
+                mask=valid_row & valid_h,
+                other=0.0,
+            )
+            logits += tl.sum(weighted * weight[:, None], axis=0)
+
+        logits = tl.where(valid_row & valid_n, logits, -float("inf"))
+
+        prev_values = tl.load(
+            best_values_ptr + row * stride_bm + offs_k * stride_bk,
+            mask=valid_row,
+            other=-float("inf"),
+        )
+        prev_indices = tl.load(
+            best_indices_ptr + row * stride_bm + offs_k * stride_bk,
+            mask=valid_row,
+            other=-1,
+        )
+        prev_valid = valid_row & (prev_indices >= 0)
+
+        prev_bits = prev_values.to(tl.int32, bitcast=True)
+        prev_sign = prev_bits >> 31
+        prev_key = tl.where(prev_sign == 0, prev_bits ^ -1, prev_bits ^ min_i32)
+        prev_key = tl.where(prev_valid, prev_key, invalid_key)
+        prev_packed = ((prev_key.to(tl.int64) & 0xFFFFFFFF) << 32) | (
+            prev_indices.to(tl.int64) & 0xFFFFFFFF
+        )
+
+        tile_bits = logits.to(tl.int32, bitcast=True)
+        tile_sign = tile_bits >> 31
+        tile_key = tl.where(tile_sign == 0, tile_bits ^ -1, tile_bits ^ min_i32)
+        tile_key = tl.where(valid_row & valid_n, tile_key, invalid_key)
+        tile_packed = ((tile_key.to(tl.int64) & 0xFFFFFFFF) << 32) | (
+            offs_n.to(tl.int64) & 0xFFFFFFFF
+        )
+
+        merged = tl.interleave(prev_packed, tile_packed)
+        sorted_merged = tl.sort(merged, descending=False)
+
+        sorted_key = ((sorted_merged >> 32) & 0xFFFFFFFF).to(tl.int32)
+        sorted_index = (sorted_merged & 0xFFFFFFFF).to(tl.int32)
+        sorted_valid = sorted_key != invalid_key
+
+        sorted_sign = sorted_key >> 31
+        sorted_bits = tl.where(sorted_sign < 0, sorted_key ^ -1, sorted_key ^ min_i32)
+        sorted_values = sorted_bits.to(tl.float32, bitcast=True)
+        sorted_values = tl.where(sorted_valid, sorted_values, -float("inf"))
+        sorted_index = tl.where(sorted_valid, sorted_index, -1)
+
+        store_mask = valid_row & (offs_merged < topk)
+        tl.store(
+            best_values_ptr + row * stride_bm + offs_merged * stride_bk,
+            sorted_values,
+            mask=store_mask,
+        )
+        tl.store(
+            best_indices_ptr + row * stride_bm + offs_merged * stride_bk,
+            sorted_index,
+            mask=store_mask,
+        )
 
 
 def fp8_mqa_topk_indices_triton(
@@ -385,7 +418,9 @@ def fp8_mqa_topk_indices_triton(
 
     block_h = 4 if topk >= 2048 else 8
     block_d = 16 if topk >= 2048 else 32
-    for tile_start in range(0, seq_len_kv, topk):
+    k_tiles_per_launch = _fp8_mqa_topk_stream_k_tiles_per_launch(seq_len_kv, topk)
+    kv_tile_width = topk * k_tiles_per_launch
+    for tile_start in range(0, seq_len_kv, kv_tile_width):
         _fp8_mqa_topk_stream_kernel[(num_q,)](
             q,
             k_fp8,
@@ -412,6 +447,7 @@ def fp8_mqa_topk_indices_triton(
             best_values.stride(1),
             BLOCK_D=block_d,
             BLOCK_H=block_h,
+            K_TILES_PER_LAUNCH=k_tiles_per_launch,
             num_warps=8,
         )
     return True

@@ -1,5 +1,5 @@
 # Baseline image for DeepSeek V4 Flash on GB10 with the local SM12x static MLA
-# path and FlashInfer B12x W4A16 MoE enabled.
+# path, combined prefill opts, and FlashInfer B12x W4A16 MoE enabled.
 #
 # Build from the workspace root, not from the vLLM repo root, because this
 # Dockerfile copies both ./vllm and the sibling ./flashinfer-latest checkout:
@@ -12,8 +12,8 @@
 ARG BASE_IMAGE=sparkrun-vllm-ds4-gb10:ae353d502-static-mla-dirty-20260518T000139Z-cuda13.2-nccl2.30-vllm-openai-base
 FROM ${BASE_IMAGE}
 
-LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 FlashInfer static MLA baseline"
-LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA plus FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
+LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 FlashInfer combined prefill baseline"
+LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
 
 COPY vllm/vllm/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py
 COPY vllm/vllm/config/kernel.py /usr/local/lib/python3.12/dist-packages/vllm/config/kernel.py
@@ -21,7 +21,9 @@ COPY vllm/vllm/utils/flashinfer.py /usr/local/lib/python3.12/dist-packages/vllm/
 COPY vllm/vllm/model_executor/layers/fused_moe/modular_kernel.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py
 COPY vllm/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
 COPY vllm/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+COPY vllm/vllm/model_executor/layers/deepseek_v4_attention.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/deepseek_v4_attention.py
 COPY vllm/vllm/tool_parsers/deepseekv32_tool_parser.py /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/deepseekv32_tool_parser.py
+COPY vllm/vllm/v1/attention/backends/mla/sparse_mla_env.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py
 COPY vllm/vllm/v1/attention/backends/mla/sparse_mla_kernels.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
 COPY vllm/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_deep_gemm_fallbacks.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_deep_gemm_fallbacks.py
 COPY vllm/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py
@@ -39,7 +41,9 @@ RUN python3 -m py_compile \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/deepseek_v4_attention.py \
       /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/deepseekv32_tool_parser.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_kernels.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_deep_gemm_fallbacks.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py \

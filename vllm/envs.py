@@ -172,6 +172,8 @@ if TYPE_CHECKING:
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
+    VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE: int = 0
+    VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_MIN_TOKENS: int = 8192
     VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
     VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
     VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool | None = None
@@ -180,6 +182,7 @@ if TYPE_CHECKING:
     VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS: int = 64
     VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: int = 256
     VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: int = 8192
+    VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES: int = 1
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -302,6 +305,16 @@ def maybe_convert_int(value: str | None) -> int | None:
     if value is None:
         return None
     return int(value)
+
+
+def env_int_or_default(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 def maybe_convert_int_list(value: str | None) -> list[int] | None:
@@ -1329,6 +1342,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", "512")
     ),
+    "VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE": lambda: env_int_or_default(
+        "VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE", 0
+    ),
+    "VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_MIN_TOKENS": (
+        lambda: env_int_or_default(
+            "VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_MIN_TOKENS", 8192
+        )
+    ),
     "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE", "256")
     ),
@@ -1354,6 +1375,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS": lambda: int(
         os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS", "8192")
+    ),
+    "VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES": lambda: env_int_or_default(
+        "VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES", 1
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no
