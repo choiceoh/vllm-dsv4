@@ -384,7 +384,7 @@ def fp8_mqa_topk_indices_triton(
     out.fill_(-1)
 
     block_h = 4 if topk >= 2048 else 8
-    block_d = 16 if topk >= 2048 else 64
+    block_d = 16 if topk >= 2048 else 32
     for tile_start in range(0, seq_len_kv, topk):
         _fp8_mqa_topk_stream_kernel[(num_q,)](
             q,

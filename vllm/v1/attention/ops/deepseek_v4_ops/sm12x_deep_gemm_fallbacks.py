@@ -35,8 +35,21 @@ def _use_triton_prefill_mqa_topk(
     k_values: torch.Tensor,
     topk_indices: torch.Tensor,
 ) -> bool:
+    tile_size = _triton_prefill_mqa_topk_row_tile_size(
+        q_values,
+        k_values,
+        topk_indices,
+    )
+    return tile_size > 0 and q_values.shape[0] <= tile_size
+
+
+def _triton_prefill_mqa_topk_row_tile_size(
+    q_values: torch.Tensor,
+    k_values: torch.Tensor,
+    topk_indices: torch.Tensor,
+) -> int:
     if os.getenv("VLLM_SM12X_MQA_TOPK_TRITON", "0") != "1":
-        return False
+        return 0
     min_rows = _env_int(
         "VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS",
         _SM120_MQA_TOPK_TRITON_MIN_ROWS,
@@ -56,12 +69,37 @@ def _use_triton_prefill_mqa_topk(
         if topk_tokens == 2048
         else min_rows
     )
-    return (
-        row_count >= min_rows_for_topk
-        and (max_rows <= 0 or row_count <= max_rows)
-        and k_values.shape[0] >= min_kv_tokens
-        and topk_tokens in (512, 2048)
-    )
+    if (
+        row_count < min_rows_for_topk
+        or k_values.shape[0] < min_kv_tokens
+        or topk_tokens not in (512, 2048)
+    ):
+        return 0
+    if max_rows <= 0:
+        return row_count
+    if max_rows < min_rows_for_topk:
+        return 0
+    return max_rows
+
+
+def _iter_mqa_topk_row_tiles(
+    row_count: int,
+    tile_size: int,
+    min_rows: int,
+):
+    row_start = 0
+    while row_start < row_count:
+        remaining = row_count - row_start
+        if remaining <= tile_size:
+            yield row_start, row_count
+            return
+
+        row_end = row_start + tile_size
+        tail = row_count - row_end
+        if 0 < tail < min_rows:
+            row_end -= min_rows - tail
+        yield row_start, row_end
+        row_start = row_end
 
 
 def _fp8_mqa_logits_head_chunk_size(
@@ -275,27 +313,87 @@ def fp8_fp4_mqa_topk_indices(
         and q[1] is None
     ):
         return False
-    if _use_triton_prefill_mqa_topk(q[0], kv[0], topk_indices):
+    tile_size = _triton_prefill_mqa_topk_row_tile_size(q[0], kv[0], topk_indices)
+    if tile_size > 0:
         from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
             fp8_mqa_topk_indices_triton,
         )
 
-        if fp8_mqa_topk_indices_triton(
-            q[0],
-            kv,
-            weights,
-            cu_seqlen_ks,
-            cu_seqlen_ke,
-            topk_indices,
+        row_count = q[0].shape[0]
+        topk_tokens = topk_indices.shape[1]
+        configured_min_rows = _env_int(
+            "VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS",
+            _SM120_MQA_TOPK_TRITON_MIN_ROWS,
+        )
+        min_rows = (
+            max(configured_min_rows, _SM120_MQA_TOPK_TRITON_MIN_ROWS_TOPK2048)
+            if topk_tokens == 2048
+            else configured_min_rows
+        )
+        tile_count = 0
+        for row_start, row_end in _iter_mqa_topk_row_tiles(
+            row_count,
+            tile_size,
+            min_rows,
         ):
+            q_tile = q[0][row_start:row_end]
+            weights_tile = weights[row_start:row_end]
+            cu_seqlen_ks_tile = cu_seqlen_ks[row_start:row_end]
+            cu_seqlen_ke_tile = cu_seqlen_ke[row_start:row_end]
+            topk_tile = topk_indices[row_start:row_end]
+            topk_copy_back = topk_tile if not topk_tile.is_contiguous() else None
+            if topk_copy_back is not None:
+                topk_tile = torch.empty(
+                    (row_end - row_start, topk_tokens),
+                    device=topk_indices.device,
+                    dtype=topk_indices.dtype,
+                )
+            try:
+                used_triton = fp8_mqa_topk_indices_triton(
+                    q_tile if q_tile.is_contiguous() else q_tile.contiguous(),
+                    kv,
+                    weights_tile
+                    if weights_tile.is_contiguous()
+                    else weights_tile.contiguous(),
+                    cu_seqlen_ks_tile
+                    if cu_seqlen_ks_tile.is_contiguous()
+                    else cu_seqlen_ks_tile.contiguous(),
+                    cu_seqlen_ke_tile
+                    if cu_seqlen_ke_tile.is_contiguous()
+                    else cu_seqlen_ke_tile.contiguous(),
+                    topk_tile,
+                )
+            except Exception as exc:
+                logger.warning_once(
+                    "SM12x Triton prefill MQA top-k path rejected at runtime; "
+                    "falling back to torch top-k (q_rows=%s, row_tile=%s, "
+                    "kv_tokens=%s, topk=%s, error=%s: %s).",
+                    row_count,
+                    row_end - row_start,
+                    kv[0].shape[0],
+                    topk_tokens,
+                    type(exc).__name__,
+                    exc,
+                )
+                break
+            if not used_triton:
+                break
+            if topk_copy_back is not None:
+                topk_copy_back.copy_(topk_tile)
+            tile_count += 1
+        else:
             logger.warning_once(
                 "Using SM12x Triton prefill MQA top-k path "
-                "(q_rows=%s, kv_tokens=%s, topk=%s).",
-                q[0].shape[0],
+                "(q_rows=%s, row_tile=%s, row_tiles=%s, kv_tokens=%s, "
+                "topk=%s).",
+                row_count,
+                tile_size,
+                tile_count,
                 kv[0].shape[0],
-                topk_indices.shape[1],
+                topk_tokens,
             )
             return True
+
     _fp8_mqa_logits_topk_torch(
         q,
         kv,

@@ -198,6 +198,15 @@ def test_sm120_triton_prefill_mqa_topk_gate_uses_row_band(
     assert not sm12x_deep_gemm_fallbacks._use_triton_prefill_mqa_topk(
         q_large, k, torch.empty(8192, 2048, dtype=torch.int32)
     )
+    assert sm12x_deep_gemm_fallbacks._triton_prefill_mqa_topk_row_tile_size(
+        q_large, k, torch.empty(8192, 2048, dtype=torch.int32)
+    ) == 256
+    assert list(
+        sm12x_deep_gemm_fallbacks._iter_mqa_topk_row_tiles(8192, 256, 128)
+    )[-1] == (7936, 8192)
+    assert list(
+        sm12x_deep_gemm_fallbacks._iter_mqa_topk_row_tiles(300, 256, 64)
+    ) == [(0, 236), (236, 300)]
 
     monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS", "0")
     assert sm12x_deep_gemm_fallbacks._use_triton_prefill_mqa_topk(
