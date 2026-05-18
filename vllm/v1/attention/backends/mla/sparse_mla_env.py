@@ -94,6 +94,10 @@ def triton_sparse_mla_prefill_blocked_accum_enabled() -> bool:
     return envs.VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM
 
 
+def triton_sparse_mla_prefill_blocked_accum_fp32_value() -> bool:
+    return envs.VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE
+
+
 def triton_sparse_mla_prefill_block_c() -> int:
     value = envs.VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C
     if value in (16, 32):

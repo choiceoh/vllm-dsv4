@@ -11,6 +11,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     triton_sparse_mla_head_block_size,
     triton_sparse_mla_prefill_block_c,
     triton_sparse_mla_prefill_block_heads,
+    triton_sparse_mla_prefill_blocked_accum_fp32_value,
     triton_sparse_mla_prefill_blocked_accum_enabled,
 )
 
@@ -1358,6 +1359,7 @@ def _accumulate_indexed_attention_chunk_candidate_block_kernel(
     HEAD_BLOCK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    FP32_VALUE: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
     head_block_idx = tl.program_id(1)
@@ -1451,10 +1453,24 @@ def _accumulate_indexed_attention_chunk_candidate_block_kernel(
             0.0,
         )
 
-        running_acc = (
-            running_acc * previous_weight[:, None]
-            + tl.dot(candidate_weight.to(kv.dtype), kv)
-        )
+        if FP32_VALUE:
+            candidate_weight_bf = candidate_weight.to(kv.dtype)
+            value_update = tl.dot(
+                candidate_weight_bf,
+                kv,
+                out_dtype=tl.float32,
+            )
+            candidate_weight_residual = (
+                candidate_weight - candidate_weight_bf.to(tl.float32)
+            )
+            value_update += tl.dot(
+                candidate_weight_residual.to(kv.dtype),
+                kv,
+                out_dtype=tl.float32,
+            )
+        else:
+            value_update = tl.dot(candidate_weight.to(kv.dtype), kv)
+        running_acc = running_acc * previous_weight[:, None] + value_update
         running_denom = (
             running_denom * previous_weight + tl.sum(candidate_weight, 1)
         )
@@ -1636,6 +1652,7 @@ def accumulate_indexed_sparse_mla_attention_chunk(
     block_d = min(1024, triton.next_power_of_2(head_dim))
     head_block = _PREFILL_INDEXED_HEAD_BLOCK
     blocked_accum = triton_sparse_mla_prefill_blocked_accum_enabled()
+    blocked_fp32_value = triton_sparse_mla_prefill_blocked_accum_fp32_value()
     candidate_block = triton_sparse_mla_prefill_block_c()
     blocked_head_block = triton_sparse_mla_prefill_block_heads()
 
@@ -1680,6 +1697,7 @@ def accumulate_indexed_sparse_mla_attention_chunk(
             HEAD_BLOCK=blocked_head_block,
             BLOCK_D=block_d,
             BLOCK_C=candidate_block,
+            FP32_VALUE=blocked_fp32_value,
             num_warps=4,
             num_stages=2,
         )

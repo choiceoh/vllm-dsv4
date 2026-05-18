@@ -13,6 +13,7 @@ def _run_indexed_accum(
     lens: torch.Tensor,
     scale: float,
     blocked: bool,
+    fp32_value: bool,
     candidate_offset: int,
     block_c: int,
     block_heads: int,
@@ -25,6 +26,10 @@ def _run_indexed_accum(
     monkeypatch.setenv(
         "VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM",
         "1" if blocked else "0",
+    )
+    monkeypatch.setenv(
+        "VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE",
+        "1" if fp32_value else "0",
     )
     monkeypatch.setenv("VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C", str(block_c))
     monkeypatch.setenv(
@@ -120,7 +125,10 @@ def test_indexed_sparse_mla_blocked_accum_matches_legacy(
         dtype=torch.int32,
     )
 
-    def run(blocked: bool) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def run(
+        blocked: bool,
+        fp32_value: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return _run_indexed_accum(
             q=q,
             kv_flat=kv_flat,
@@ -128,6 +136,7 @@ def test_indexed_sparse_mla_blocked_accum_matches_legacy(
             lens=lens,
             scale=scale,
             blocked=blocked,
+            fp32_value=fp32_value,
             candidate_offset=candidate_offset,
             block_c=block_c,
             block_heads=block_heads,
@@ -136,15 +145,24 @@ def test_indexed_sparse_mla_blocked_accum_matches_legacy(
 
     legacy_max, legacy_denom, legacy_acc = run(False)
     blocked_max, blocked_denom, blocked_acc = run(True)
+    fp32_max, fp32_denom, fp32_acc = run(True, fp32_value=True)
 
-    assert torch.isfinite(blocked_denom).all()
-    assert torch.isfinite(blocked_acc).all()
-    assert torch.all(blocked_denom[0] == 0)
-    assert torch.all(blocked_denom[3] == 0)
-    torch.testing.assert_close(blocked_max, legacy_max, rtol=5e-3, atol=5e-3)
-    torch.testing.assert_close(blocked_denom, legacy_denom, rtol=5e-3, atol=5e-3)
-    torch.testing.assert_close(blocked_acc, legacy_acc, rtol=6e-3, atol=6e-3)
+    for test_max, test_denom, test_acc in (
+        (blocked_max, blocked_denom, blocked_acc),
+        (fp32_max, fp32_denom, fp32_acc),
+    ):
+        assert torch.isfinite(test_denom).all()
+        assert torch.isfinite(test_acc).all()
+        assert torch.all(test_denom[0] == 0)
+        assert torch.all(test_denom[3] == 0)
+        torch.testing.assert_close(test_max, legacy_max, rtol=5e-3, atol=5e-3)
+        torch.testing.assert_close(test_denom, legacy_denom, rtol=5e-3, atol=5e-3)
+        torch.testing.assert_close(test_acc, legacy_acc, rtol=6e-3, atol=6e-3)
 
     legacy_out = legacy_acc / legacy_denom[..., None].clamp_min(1.0e-20)
-    blocked_out = blocked_acc / blocked_denom[..., None].clamp_min(1.0e-20)
-    torch.testing.assert_close(blocked_out, legacy_out, rtol=6e-3, atol=6e-3)
+    for test_acc, test_denom in (
+        (blocked_acc, blocked_denom),
+        (fp32_acc, fp32_denom),
+    ):
+        test_out = test_acc / test_denom[..., None].clamp_min(1.0e-20)
+        torch.testing.assert_close(test_out, legacy_out, rtol=6e-3, atol=6e-3)
