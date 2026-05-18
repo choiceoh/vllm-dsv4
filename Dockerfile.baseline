@@ -15,6 +15,17 @@ FROM ${BASE_IMAGE}
 LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 FlashInfer combined prefill baseline"
 LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
 
+ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
+    VLLM_SM12X_MQA_TOPK_TRITON=1 \
+    VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS=64 \
+    VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512 \
+    VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS=8192 \
+    VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES=2 \
+    VLLM_TRITON_MLA_SPARSE=1 \
+    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE=2048 \
+    VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE=1024 \
+    VLLM_MARLIN_USE_ATOMIC_ADD=1
+
 COPY vllm/vllm/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py
 COPY vllm/vllm/config/kernel.py /usr/local/lib/python3.12/dist-packages/vllm/config/kernel.py
 COPY vllm/vllm/utils/flashinfer.py /usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py

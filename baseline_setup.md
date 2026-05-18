@@ -70,7 +70,9 @@ DOCKER_BUILDKIT=1 docker build \
 ```
 
 The build-time assertion checks that vLLM can see the FlashInfer B12x W4A16
-entrypoints:
+entrypoints. The Dockerfile also bakes the row512/q2048 runtime env defaults
+listed in the recipe below, so future overlay images inherit this baseline even
+when the launch recipe does not restate every knob.
 
 ```python
 from vllm.utils.flashinfer import has_flashinfer_b12x_fused_moe
