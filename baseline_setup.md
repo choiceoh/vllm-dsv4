@@ -18,24 +18,31 @@ can build one baseline image and then layer experiments on top of that image.
 - MoE backend: `FLASHINFER_B12X_MXFP4_BF16`
 - Static MLA/MQA path: `VLLM_SM12X_MQA_TOPK_TRITON=1`
 - Combined prefill opts:
-  `VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES=2` and
+  `VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512`,
+  `VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES=2`,
+  `VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE=2048`, and
   `VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE=1024`
 
 The validated warm measured results for this setup were:
 
-- 32k request: `466.81 tok/s` server prefill, `40.17 tok/s` server decode
-- 128k request: `515.77 tok/s` server prefill, `33.76 tok/s` server decode
+- 32k request: `454.57 tok/s` server prefill, `44.74 tok/s` server decode
+- 128k request: `559.72 tok/s` server prefill, `37.13 tok/s` server decode
 - Prefix cache hits: `0` for every warmup and measured leg
 
-Compared to the same patched image with the new knobs off:
+Compared to the previous committed combined-prefill recipe
+(`row_tile=256`, `query_chunk=1024`):
 
-- 32k measured prefill: `+1.91%`; decode: `+2.15%`
-- 128k measured prefill: `+3.68%`; decode: `+1.00%`
+- 32k measured prefill: `-2.62%`; decode: `+11.37%`
+- 128k measured prefill: `+8.52%`; decode: `+9.98%`
 
-The full A/B artifact is:
+This is an intentional long-context baseline tradeoff: keep the row512/q2048
+recipe because 128k prefill and decode improve materially, while the measured
+32k prefill dip is small enough for this baseline.
+
+The full benchmark artifact is:
 
 ```text
-/home/aidendle94/Documents/workspace/experiment_runs/ab_compare_combined_prefill_opts_20260518T065955Z/report.md
+/home/aidendle94/Documents/workspace/experiment_runs/aggressive_row512_q2048_32k_128k_20260518T074836Z/report.md
 ```
 
 ## Build The Baseline Image
@@ -107,11 +114,11 @@ env:
   VLLM_USE_FLASHINFER_MOE_B12X_W4A16: "1"
   VLLM_SM12X_MQA_TOPK_TRITON: "1"
   VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS: "64"
-  VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: "256"
+  VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: "512"
   VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: "8192"
   VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES: "2"
   VLLM_TRITON_MLA_SPARSE: "1"
-  VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: "1024"
+  VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: "2048"
   VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE: "1024"
   VLLM_MARLIN_USE_ATOMIC_ADD: "1"
   VLLM_NCCL_SO_PATH: /usr/lib/aarch64-linux-gnu/libnccl.so.2
@@ -151,13 +158,14 @@ cd /home/aidendle94/Documents/workspace/vllm-ds4-sm120-harness
 sparkrun run /tmp/deepseek-v4-flash-gb10-combined-prefill-baseline.yaml --no-follow
 ```
 
-If reusing an older checked harness recipe, make sure it includes the two
-combined-prefill env vars above and remove any `--profiler-config` unless you
-are intentionally taking a profile. The old static-MLA profile recipe is not the
+If reusing an older checked harness recipe, make sure it includes the
+combined-prefill env vars above, uses `MAX_ROWS=512` and
+`QUERY_CHUNK_SIZE=2048`, and removes any `--profiler-config` unless you are
+intentionally taking a profile. The old static-MLA profile recipe is not the
 clean throughput baseline by itself.
 
 ```bash
-rg "STREAM_K_TILES|PREFILL_TOPK_CHUNK|profiler-config" sparkrun/*.yaml
+rg "MAX_ROWS|STREAM_K_TILES|QUERY_CHUNK|PREFILL_TOPK_CHUNK|profiler-config" sparkrun/*.yaml
 ```
 
 ## Validation
@@ -180,7 +188,7 @@ Expected evidence:
 
 ```text
 Using 'FLASHINFER_B12X_MXFP4_BF16' Mxfp4 MoE backend.
-Using SM12x Triton prefill MQA top-k path (... row_tile=256 ...)
+Using SM12x Triton prefill MQA top-k path (... row_tile=512 ...)
 GET /health HTTP/1.1" 200 OK
 ```
 
