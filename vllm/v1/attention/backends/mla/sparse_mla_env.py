@@ -7,7 +7,7 @@ import os
 import torch
 
 import vllm.envs as envs
-from vllm.platforms import current_platform
+import vllm.platforms as platforms
 
 _TRITON_SPARSE_MLA_PREFILL_TOPK_CHUNK_MIN_TOKENS = 8192
 
@@ -23,6 +23,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _is_sm12x_device(device: torch.device) -> bool:
+    current_platform = platforms.current_platform
     if not current_platform.is_cuda():
         return False
     index = (
@@ -42,7 +43,7 @@ def is_triton_sparse_mla_enabled_for_platform() -> bool:
     configured = triton_sparse_mla_configured()
     if configured is not None:
         return configured
-    return current_platform.is_device_capability_family(120)
+    return platforms.current_platform.is_device_capability_family(120)
 
 
 def is_triton_sparse_mla_enabled(device: torch.device) -> bool:
@@ -89,11 +90,29 @@ def triton_sparse_mla_head_block_size() -> int | None:
     return None
 
 
+def triton_sparse_mla_prefill_blocked_accum_enabled() -> bool:
+    return envs.VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM
+
+
+def triton_sparse_mla_prefill_block_c() -> int:
+    value = envs.VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C
+    if value in (16, 32):
+        return value
+    return 0
+
+
+def triton_sparse_mla_prefill_block_heads() -> int:
+    value = envs.VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS
+    if value in (1, 2, 4, 8):
+        return value
+    return 0
+
+
 def triton_sparse_mla_matmul_decode_enabled() -> bool:
     configured = envs.VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE
     if configured is not None:
         return configured
-    return current_platform.is_device_capability_family(120)
+    return platforms.current_platform.is_device_capability_family(120)
 
 
 def triton_sparse_mla_splitkv_decode_enabled() -> bool:

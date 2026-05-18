@@ -9,6 +9,9 @@ import torch
 from vllm.triton_utils import LOG2E, LOGE2, tl, triton
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     triton_sparse_mla_head_block_size,
+    triton_sparse_mla_prefill_block_c,
+    triton_sparse_mla_prefill_block_heads,
+    triton_sparse_mla_prefill_blocked_accum_enabled,
 )
 
 _SPLITKV_HEAD_BLOCK = 16
@@ -1327,6 +1330,157 @@ _PREFILL_INDEXED_HEAD_BLOCK = 8
 
 
 @triton.jit
+def _accumulate_indexed_attention_chunk_candidate_block_kernel(
+    q_ptr,
+    kv_flat_ptr,
+    indices_ptr,
+    lens_ptr,
+    max_score_ptr,
+    denom_ptr,
+    acc_ptr,
+    stride_q_t: tl.constexpr,
+    stride_q_h: tl.constexpr,
+    stride_q_d: tl.constexpr,
+    stride_kv_t,
+    stride_kv_d: tl.constexpr,
+    stride_indices_t: tl.constexpr,
+    stride_indices_c: tl.constexpr,
+    stride_state_t: tl.constexpr,
+    stride_state_h: tl.constexpr,
+    stride_acc_t: tl.constexpr,
+    stride_acc_h: tl.constexpr,
+    stride_acc_d: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    num_candidates,
+    candidate_offset,
+    scale: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+    head_block_idx = tl.program_id(1)
+    head_offsets = head_block_idx * HEAD_BLOCK + tl.arange(0, HEAD_BLOCK)
+    dim_offsets = tl.arange(0, BLOCK_D)
+    candidate_offsets = tl.arange(0, BLOCK_C)
+    head_mask = head_offsets < num_heads
+    dim_mask = dim_offsets < head_dim
+
+    q = tl.load(
+        q_ptr
+        + token_idx * stride_q_t
+        + head_offsets[:, None] * stride_q_h
+        + dim_offsets[None, :] * stride_q_d,
+        mask=head_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    )
+
+    state_base = token_idx * stride_state_t
+    running_max = tl.load(
+        max_score_ptr + state_base + head_offsets * stride_state_h,
+        mask=head_mask,
+        other=float("-inf"),
+    )
+    running_denom = tl.load(
+        denom_ptr + state_base + head_offsets * stride_state_h,
+        mask=head_mask,
+        other=0.0,
+    )
+    acc_base = token_idx * stride_acc_t
+    running_acc = tl.load(
+        acc_ptr
+        + acc_base
+        + head_offsets[:, None] * stride_acc_h
+        + dim_offsets[None, :] * stride_acc_d,
+        mask=head_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    valid_len = tl.load(lens_ptr + token_idx)
+    local_eff = tl.minimum(
+        num_candidates,
+        tl.maximum(valid_len - candidate_offset, 0),
+    )
+    neg_large = -1.0e30
+
+    for candidate_start in range(0, num_candidates, BLOCK_C):
+        offsets_c = candidate_start + candidate_offsets
+        candidate_mask = offsets_c < local_eff
+        kv_indices = tl.load(
+            indices_ptr + token_idx * stride_indices_t + offsets_c * stride_indices_c,
+            mask=candidate_mask,
+            other=-1,
+        )
+        candidate_mask = candidate_mask & (kv_indices >= 0)
+
+        kv = tl.load(
+            kv_flat_ptr
+            + kv_indices[:, None].to(tl.int64) * stride_kv_t
+            + dim_offsets[None, :] * stride_kv_d,
+            mask=candidate_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
+
+        scores = tl.dot(q, tl.trans(kv)) * scale
+        scores = tl.where(
+            head_mask[:, None] & candidate_mask[None, :],
+            scores,
+            neg_large,
+        )
+
+        block_max = tl.max(scores, 1)
+        has_candidate = head_mask & (block_max > neg_large * 0.5)
+        next_max = tl.where(
+            has_candidate,
+            tl.maximum(running_max, block_max),
+            running_max,
+        )
+
+        old_max = tl.where(has_candidate, running_max, 0.0)
+        new_max = tl.where(has_candidate, next_max, 0.0)
+        previous_weight = tl.exp(old_max - new_max)
+
+        active_mask = head_mask[:, None] & candidate_mask[None, :]
+        safe_scores = tl.where(active_mask, scores, 0.0)
+        safe_max = tl.where(active_mask, next_max[:, None], 0.0)
+        candidate_weight = tl.exp(safe_scores - safe_max)
+        candidate_weight = tl.where(
+            active_mask,
+            candidate_weight,
+            0.0,
+        )
+
+        running_acc = (
+            running_acc * previous_weight[:, None]
+            + tl.dot(candidate_weight.to(kv.dtype), kv)
+        )
+        running_denom = (
+            running_denom * previous_weight + tl.sum(candidate_weight, 1)
+        )
+        running_max = next_max
+
+    tl.store(
+        max_score_ptr + state_base + head_offsets * stride_state_h,
+        running_max,
+        mask=head_mask,
+    )
+    tl.store(
+        denom_ptr + state_base + head_offsets * stride_state_h,
+        running_denom,
+        mask=head_mask,
+    )
+    tl.store(
+        acc_ptr
+        + acc_base
+        + head_offsets[:, None] * stride_acc_h
+        + dim_offsets[None, :] * stride_acc_d,
+        running_acc,
+        mask=head_mask[:, None] & dim_mask[None, :],
+    )
+
+
+@triton.jit
 def _accumulate_indexed_attention_chunk_multihead_kernel(
     q_ptr,
     kv_flat_ptr,
@@ -1481,8 +1635,55 @@ def accumulate_indexed_sparse_mla_attention_chunk(
     num_candidates = indices.shape[1]
     block_d = min(1024, triton.next_power_of_2(head_dim))
     head_block = _PREFILL_INDEXED_HEAD_BLOCK
+    blocked_accum = triton_sparse_mla_prefill_blocked_accum_enabled()
+    candidate_block = triton_sparse_mla_prefill_block_c()
+    blocked_head_block = triton_sparse_mla_prefill_block_heads()
 
-    if num_heads >= head_block:
+    if (
+        blocked_accum
+        and candidate_block >= 16
+        and blocked_head_block > 0
+        and block_d >= 16
+        and block_d <= 512
+        and (candidate_block == 16 or block_d <= 256)
+        and num_candidates > 0
+        and num_heads >= blocked_head_block
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and kv_flat.dtype == q.dtype
+    ):
+        grid = (num_tokens, triton.cdiv(num_heads, blocked_head_block))
+        _accumulate_indexed_attention_chunk_candidate_block_kernel[grid](
+            q,
+            kv_flat,
+            indices,
+            lens,
+            max_score,
+            denom,
+            acc,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            kv_flat.stride(0),
+            kv_flat.stride(1),
+            indices.stride(0),
+            indices.stride(1),
+            max_score.stride(0),
+            max_score.stride(1),
+            acc.stride(0),
+            acc.stride(1),
+            acc.stride(2),
+            num_heads,
+            head_dim,
+            num_candidates,
+            candidate_offset,
+            scale,
+            HEAD_BLOCK=blocked_head_block,
+            BLOCK_D=block_d,
+            BLOCK_C=candidate_block,
+            num_warps=4,
+            num_stages=2,
+        )
+    elif num_heads >= head_block:
         grid = (num_tokens, triton.cdiv(num_heads, head_block))
         _accumulate_indexed_attention_chunk_multihead_kernel[grid](
             q,
