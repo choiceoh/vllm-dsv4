@@ -1,4 +1,4 @@
-# DeepSeek V4 Flash GB10 H8D32W4 Prefill Baseline Setup
+# DeepSeek V4 Flash GB10 Row-Tiled Logits Baseline Setup
 
 This baseline captures the working two-node GB10 setup validated on
 2026-05-19. It is meant to be a stable starting image for future agents so they
@@ -7,7 +7,9 @@ can build one baseline image and then layer experiments on top of that image.
 ## What This Baseline Contains
 
 - vLLM branch: `production-baseline-20260515`
-- vLLM source savepoint: the commit that contains this file, descending from
+- vLLM source savepoint: the commit or worktree state that contains this file,
+  the row-tiled logits change in `sm12x_deep_gemm_fallbacks.py`, and the
+  baseline Dockerfile update, descending from
   `5b5b63ded docs: checkpoint flashinfer static mla baseline`
 - FlashInfer checkout: `/home/aidendle94/Documents/workspace/flashinfer-latest`
 - FlashInfer branch: `pr-3336-w4a16-rewrite`
@@ -17,6 +19,9 @@ can build one baseline image and then layer experiments on top of that image.
 - Context shape: `max_model_len=262144`, `max_num_batched_tokens=8192`, `max_num_seqs=1`
 - MoE backend: `FLASHINFER_B12X_MXFP4_BF16`
 - Static MLA/MQA path: `VLLM_SM12X_MQA_TOPK_TRITON=1`
+- MQA top-k baseline: row-tiled materialized logits enabled with
+  `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED=1` and
+  `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE=512`
 - Combined prefill opts:
   `VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512`,
   `VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES=2`,
@@ -35,7 +40,15 @@ can build one baseline image and then layer experiments on top of that image.
 The source-level blocked accumulator knob remains default-off. This baseline
 opts in through the Dockerfile and launch recipe after service-level validation.
 
-The validated warm measured prefill ruler for this setup was:
+The current row-tiled logits warm measurements are:
+
+| context | max output | measured prefill tok/s | measured decode tok/s | prefill seconds | prefix hits |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32k | 1 | 1233.11 | n/a | 25.95 | 0 |
+| 128k | 1 | 961.68 | n/a | 133.10 | 0 |
+| 128k | 64 | 938.33 | 26.48 | 136.42 | 0 |
+
+The previous H8/D32/W4 streaming baseline warm measured prefill ruler was:
 
 | context | measured prefill tok/s | prefill seconds |
 | ---: | ---: | ---: |
@@ -71,9 +84,10 @@ The 128k haystack run was the first post-launch long request and showed
 first-use Triton JIT warnings for metadata, logits, top-k, attention, and MoE
 kernels. The 200k haystack was run immediately afterward on the same server.
 
-This promotes row512/q2048 plus blocked sparse MLA accumulation plus H8/D32/W4
-topk512 stream scheduling as the baseline. The optimization does not reduce
-`topk`; it only changes the Triton scheduling shape for topk512.
+This promotes row512/q2048 plus blocked sparse MLA accumulation plus row-tiled
+materialized MQA logits top-k as the baseline. The optimization does not reduce
+`topk`; it computes exact topk512 over full logits in row tiles, with the
+streaming H8/D32/W4 path kept as the fallback for non-eligible shapes.
 
 The full benchmark artifact is:
 
@@ -83,6 +97,9 @@ The full benchmark artifact is:
 /home/aidendle94/Documents/workspace/experiment_runs/topk_h8d32w4_prefill_ruler_20260519T024613Z/report.md
 /home/aidendle94/Documents/workspace/experiment_runs/topk_h8d32w4_haystack_20260519T034225Z/128k/long_context_probe.md
 /home/aidendle94/Documents/workspace/experiment_runs/topk_h8d32w4_haystack_20260519T034225Z/200k/long_context_probe.md
+/home/aidendle94/Documents/workspace/experiment_runs/mqa_logits_rowtile_20260519T070940Z/runs/rowtile_32000/warm_results.json
+/home/aidendle94/Documents/workspace/experiment_runs/mqa_logits_rowtile_20260519T070940Z/runs/rowtile_128000/warm_results.json
+/home/aidendle94/Documents/workspace/experiment_runs/rowtiled_logits_baseline_20260519T081248Z/runs/rowtiled_baseline_128000_decode64/warm_results.json
 ```
 
 ## Build The Baseline Image
@@ -97,7 +114,7 @@ export WORKSPACE=/home/aidendle94/Documents/workspace
 export VLLM_ROOT=${WORKSPACE}/vllm
 export BASE_IMAGE=sparkrun-vllm-ds4-gb10:ae353d502-static-mla-dirty-20260518T000139Z-cuda13.2-nccl2.30-vllm-openai-base
 export BASELINE_REF=$(git -C "${VLLM_ROOT}" rev-parse --short HEAD)
-export BASELINE_IMAGE=sparkrun-vllm-ds4-gb10:${BASELINE_REF}-h8d32w4-prefill-baseline-cuda13.2-nccl2.30-vllm-openai-base
+export BASELINE_IMAGE=sparkrun-vllm-ds4-gb10:${BASELINE_REF}-rowtiled-logits-baseline-cuda13.2-nccl2.30-vllm-openai-base
 
 git -C "${VLLM_ROOT}" merge-base --is-ancestor 5b5b63ded HEAD
 test "$(git -C "${WORKSPACE}/flashinfer-latest" rev-parse HEAD)" = "a52ad3a649ab3716efe738be24e837566117d2b3"
@@ -110,10 +127,11 @@ DOCKER_BUILDKIT=1 docker build \
 ```
 
 The build-time assertion checks that vLLM can see the FlashInfer B12x W4A16
-entrypoints. The Dockerfile also bakes the row512/q2048 runtime env defaults,
-H8/D32/W4 topk512 stream env defaults, and blocked sparse MLA accumulator env
-defaults listed in the recipe below, so future overlay images inherit this
-baseline even when the launch recipe does not restate every knob.
+entrypoints. The Dockerfile also bakes the row-tiled logits top-k env defaults,
+row512/q2048 runtime env defaults, H8/D32/W4 stream fallback env defaults, and
+blocked sparse MLA accumulator env defaults listed in the recipe below, so
+future overlay images inherit this baseline even when the launch recipe does
+not restate every knob.
 
 ```python
 from vllm.utils.flashinfer import has_flashinfer_b12x_fused_moe
@@ -129,11 +147,11 @@ only when intentionally testing a descendant image.
 
 ```yaml
 recipe_version: "1"
-name: DeepSeek V4 Flash GB10 H8D32W4 prefill baseline
-description: DeepSeek V4 Flash GB10 baseline with FlashInfer B12x W4A16, static SM12x MQA top-k, H8/D32/W4 topk512 scheduling, blocked sparse MLA prefill accumulation, combined prefill opts, MTP=2, and 262k context.
+name: DeepSeek V4 Flash GB10 row-tiled logits prefill baseline
+description: DeepSeek V4 Flash GB10 baseline with FlashInfer B12x W4A16, static SM12x MQA top-k, row-tiled materialized logits top-k, blocked sparse MLA prefill accumulation, combined prefill opts, MTP=2, and 262k context.
 runtime: vllm-distributed
 model: deepseek-ai/DeepSeek-V4-Flash
-container: sparkrun-vllm-ds4-gb10:<commit>-h8d32w4-prefill-baseline-cuda13.2-nccl2.30-vllm-openai-base
+container: sparkrun-vllm-ds4-gb10:<commit>-rowtiled-logits-baseline-cuda13.2-nccl2.30-vllm-openai-base
 cluster_only: true
 min_nodes: 2
 max_nodes: 2
@@ -156,6 +174,8 @@ env:
   VLLM_ENFORCE_STRICT_TOOL_CALLING: "1"
   VLLM_USE_FLASHINFER_MOE_B12X_W4A16: "1"
   VLLM_SM12X_MQA_TOPK_TRITON: "1"
+  VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED: "1"
+  VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE: "512"
   VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS: "64"
   VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: "512"
   VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: "8192"
@@ -205,19 +225,20 @@ Launch it:
 
 ```bash
 cd /home/aidendle94/Documents/workspace/vllm-ds4-sm120-harness
-sparkrun run /tmp/deepseek-v4-flash-gb10-h8d32w4-prefill-baseline.yaml --no-follow
+sparkrun run /tmp/deepseek-v4-flash-gb10-rowtiled-logits-baseline.yaml --no-follow
 ```
 
 If reusing an older checked harness recipe, make sure it includes the
 combined-prefill and blocked-accumulator env vars above, uses `MAX_ROWS=512`,
 `QUERY_CHUNK_SIZE=2048`, `PREFILL_BLOCK_C=16`, `PREFILL_BLOCK_HEADS=8`, and
-the H8/D32/W4 topk512 env vars, and removes any `--profiler-config` unless you
+the row-tiled logits and H8/D32/W4 fallback topk512 env vars, and removes any
+`--profiler-config` unless you
 are intentionally taking a profile.
 The old static-MLA profile recipe is not the clean throughput baseline by
 itself.
 
 ```bash
-rg "MAX_ROWS|STREAM_K_TILES|TOPK512|QUERY_CHUNK|PREFILL_TOPK_CHUNK|BLOCKED_ACCUM|BLOCK_C|BLOCK_HEADS|profiler-config" sparkrun/*.yaml
+rg "LOGITS_ROW|MAX_ROWS|STREAM_K_TILES|TOPK512|QUERY_CHUNK|PREFILL_TOPK_CHUNK|BLOCKED_ACCUM|BLOCK_C|BLOCK_HEADS|profiler-config" sparkrun/*.yaml
 ```
 
 ## Validation
@@ -233,14 +254,14 @@ Required log evidence:
 
 ```bash
 sparkrun logs <cluster-id> --tail 300 | rg \
-  "FLASHINFER_B12X|Using SM12x Triton prefill MQA|Started server process|GET /health"
+  "FLASHINFER_B12X|materialized MQA logits top-k row-tiled|Started server process|GET /health"
 ```
 
 Expected evidence:
 
 ```text
 Using 'FLASHINFER_B12X_MXFP4_BF16' Mxfp4 MoE backend.
-Using SM12x Triton prefill MQA top-k path (... row_tile=512 ...)
+Using SM12x Triton materialized MQA logits top-k row-tiled path (... row_tile=512 ...)
 GET /health HTTP/1.1" 200 OK
 ```
 
@@ -248,7 +269,7 @@ Required recipe evidence:
 
 ```bash
 sparkrun export running-recipe <cluster-id> | rg \
-  "BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|QUERY_CHUNK_SIZE|MAX_ROWS|TOPK512"
+  "BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|QUERY_CHUNK_SIZE|LOGITS_ROW|MAX_ROWS|TOPK512"
 ```
 
 Expected recipe evidence:
@@ -259,14 +280,16 @@ VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE: '1'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C: '16'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS: '8'
 VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: '2048'
+VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED: '1'
+VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE: '512'
 VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: '512'
 VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H: '8'
 VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D: '32'
 VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS: '4'
 ```
 
-The first long request may still show a Triton JIT warning for
-`_fp8_mqa_topk_stream_kernel` if that exact stream-grouped shape was not covered
+The first long request may still show Triton JIT warnings for row-tiled logits,
+metadata, sparse MLA, MoE, or decode kernels if that exact shape was not covered
 by warmup. Treat the second request at the same context length as the warm
 measurement.
 

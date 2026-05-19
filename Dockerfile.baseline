@@ -1,5 +1,5 @@
 # Baseline image for DeepSeek V4 Flash on GB10 with the local SM12x static MLA
-# path, H8/D32/W4 topk512 stream scheduling, blocked sparse MLA prefill
+# path, row-tiled materialized MQA logits top-k, blocked sparse MLA prefill
 # accumulation, combined prefill opts, and FlashInfer B12x W4A16 MoE enabled.
 #
 # Build from the workspace root, not from the vLLM repo root, because this
@@ -13,11 +13,13 @@
 ARG BASE_IMAGE=sparkrun-vllm-ds4-gb10:ae353d502-static-mla-dirty-20260518T000139Z-cuda13.2-nccl2.30-vllm-openai-base
 FROM ${BASE_IMAGE}
 
-LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 H8D32W4 prefill baseline"
-LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, H8/D32/W4 topk512 stream scheduling, blocked sparse MLA prefill accumulation, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
+LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 row-tiled logits prefill baseline"
+LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, row-tiled materialized MQA logits top-k, blocked sparse MLA prefill accumulation, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
 
 ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     VLLM_SM12X_MQA_TOPK_TRITON=1 \
+    VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED=1 \
+    VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE=512 \
     VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS=64 \
     VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512 \
     VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS=8192 \
