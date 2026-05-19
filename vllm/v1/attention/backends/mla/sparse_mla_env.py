@@ -112,6 +112,20 @@ def triton_sparse_mla_prefill_block_heads() -> int:
     return 0
 
 
+def triton_sparse_mla_prefill_block_warps() -> int:
+    value = envs.VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_WARPS
+    if value in (4, 8):
+        return value
+    return 4
+
+
+def triton_sparse_mla_prefill_block_stages() -> int:
+    value = envs.VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_STAGES
+    if value in (2, 3):
+        return value
+    return 2
+
+
 def triton_sparse_mla_matmul_decode_enabled() -> bool:
     configured = envs.VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE
     if configured is not None:

@@ -11,6 +11,8 @@ from vllm.v1.attention.backends.mla.sparse_mla_env import (
     triton_sparse_mla_head_block_size,
     triton_sparse_mla_prefill_block_c,
     triton_sparse_mla_prefill_block_heads,
+    triton_sparse_mla_prefill_block_stages,
+    triton_sparse_mla_prefill_block_warps,
     triton_sparse_mla_prefill_blocked_accum_fp32_value,
     triton_sparse_mla_prefill_blocked_accum_enabled,
 )
@@ -24,6 +26,46 @@ _SPLITKV_MEDIUM_BATCH_MIN_TOKENS = 16
 _SPLITKV_MEDIUM_BATCH_CANDIDATES_PER_SPLIT = 512
 _SPLITKV_MEDIUM_BATCH_MAX_SPLITS = 8
 _SPLITKV_MAX_OCCUPANCY = 4
+
+
+def _prefill_blocked_indexed_accum_head_block(
+    *,
+    requested_head_block: int,
+    candidate_block: int,
+    block_d: int,
+    num_heads: int,
+) -> int:
+    if requested_head_block <= 0 or num_heads <= 0:
+        return 0
+    if candidate_block == 16:
+        return requested_head_block
+    if candidate_block == 32:
+        # The DS4 hot shape uses D=512.  A 32-candidate x 8-head tile at
+        # D=512 is too register-heavy for this portable Triton kernel, so
+        # keep the larger candidate tile but halve the head grouping.
+        if block_d <= 256:
+            return requested_head_block
+        return min(requested_head_block, 4)
+    return 0
+
+
+def _prefill_blocked_indexed_accum_params(
+    *,
+    candidate_block: int,
+    block_d: int,
+    num_heads: int,
+) -> tuple[int, int, int]:
+    head_block = _prefill_blocked_indexed_accum_head_block(
+        requested_head_block=triton_sparse_mla_prefill_block_heads(),
+        candidate_block=candidate_block,
+        block_d=block_d,
+        num_heads=num_heads,
+    )
+    return (
+        head_block,
+        triton_sparse_mla_prefill_block_warps(),
+        triton_sparse_mla_prefill_block_stages(),
+    )
 
 
 def sparse_mla_decode_head_block_size(num_decode_tokens: int) -> int:
@@ -1406,7 +1448,7 @@ def _accumulate_indexed_attention_chunk_candidate_block_kernel(
     )
     neg_large = -1.0e30
 
-    for candidate_start in range(0, num_candidates, BLOCK_C):
+    for candidate_start in tl.range(0, num_candidates, BLOCK_C):
         offsets_c = candidate_start + candidate_offsets
         candidate_mask = offsets_c < local_eff
         kv_indices = tl.load(
@@ -1654,7 +1696,15 @@ def accumulate_indexed_sparse_mla_attention_chunk(
     blocked_accum = triton_sparse_mla_prefill_blocked_accum_enabled()
     blocked_fp32_value = triton_sparse_mla_prefill_blocked_accum_fp32_value()
     candidate_block = triton_sparse_mla_prefill_block_c()
-    blocked_head_block = triton_sparse_mla_prefill_block_heads()
+    (
+        blocked_head_block,
+        blocked_num_warps,
+        blocked_num_stages,
+    ) = _prefill_blocked_indexed_accum_params(
+        candidate_block=candidate_block,
+        block_d=block_d,
+        num_heads=num_heads,
+    )
 
     if (
         blocked_accum
@@ -1662,7 +1712,6 @@ def accumulate_indexed_sparse_mla_attention_chunk(
         and blocked_head_block > 0
         and block_d >= 16
         and block_d <= 512
-        and (candidate_block == 16 or block_d <= 256)
         and num_candidates > 0
         and num_heads >= blocked_head_block
         and q.dtype in (torch.float16, torch.bfloat16)
@@ -1698,8 +1747,8 @@ def accumulate_indexed_sparse_mla_attention_chunk(
             BLOCK_D=block_d,
             BLOCK_C=candidate_block,
             FP32_VALUE=blocked_fp32_value,
-            num_warps=4,
-            num_stages=2,
+            num_warps=blocked_num_warps,
+            num_stages=blocked_num_stages,
         )
     elif num_heads >= head_block:
         grid = (num_tokens, triton.cdiv(num_heads, head_block))
@@ -1762,7 +1811,6 @@ def accumulate_indexed_sparse_mla_attention_chunk(
             scale,
             BLOCK_D=block_d,
         )
-
 
 
 @triton.autotune(

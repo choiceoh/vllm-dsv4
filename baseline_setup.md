@@ -32,19 +32,32 @@ can build one baseline image and then layer experiments on top of that image.
   `VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H=8`,
   `VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D=32`,
   `VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS=4`,
-  `VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE=2048`, and
+  `VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE=4096`, and
   `VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE=1024`
 - Blocked sparse MLA prefill accumulator enabled in the baseline image and
   recipe:
   `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM=1`,
   `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE=1`,
-  `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C=16`, and
-  `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS=8`
+  `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C=16`,
+  `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS=8`,
+  `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_WARPS=4`, and
+  `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_STAGES=2`
 
 The source-level blocked accumulator knob remains default-off. This baseline
 opts in through the Dockerfile and launch recipe after service-level validation.
 
-The current row-tiled logits warm measurements are:
+The current q4096 row-tiled logits warm measurements are:
+
+| context | max output | measured prefill tok/s | measured decode tok/s | prefix hits |
+| ---: | ---: | ---: | ---: | ---: |
+| 1k | 1 | 1131.00 | n/a | 0 |
+| 32k | 1 | 1230.11 | n/a | 0 |
+| 64k | 1 | 1182.19 | n/a | 0 |
+| 128k | 1 | 1062.85 | n/a | 0 |
+| 32k | 64 | 1153.17 | 41.35 | 0 |
+| 128k | 64 | 1051.81 | 36.34 | 0 |
+
+The prior row512/q2048 row-tiled logits warm measurements were:
 
 | context | max output | measured prefill tok/s | measured decode tok/s | prefill seconds | prefix hits |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -88,7 +101,7 @@ The 128k haystack run was the first post-launch long request and showed
 first-use Triton JIT warnings for metadata, logits, top-k, attention, and MoE
 kernels. The 200k haystack was run immediately afterward on the same server.
 
-This promotes row512/q2048 plus blocked sparse MLA accumulation plus row-tiled
+This promotes row512/q4096 plus blocked sparse MLA accumulation plus row-tiled
 materialized MQA logits top-k as the baseline. The optimization does not reduce
 `topk`; it computes exact topk512 over full logits in row tiles, with the
 streaming H8/D32/W4 path kept as the fallback for non-eligible shapes.
@@ -104,6 +117,7 @@ The full benchmark artifact is:
 /home/aidendle94/Documents/workspace/experiment_runs/mqa_logits_rowtile_20260519T070940Z/runs/rowtile_32000/warm_results.json
 /home/aidendle94/Documents/workspace/experiment_runs/mqa_logits_rowtile_20260519T070940Z/runs/rowtile_128000/warm_results.json
 /home/aidendle94/Documents/workspace/experiment_runs/rowtiled_logits_baseline_20260519T081248Z/runs/rowtiled_baseline_128000_decode64/warm_results.json
+/home/aidendle94/Documents/workspace/experiment_runs/blocked_tune_q4096_20260519T183400Z/report.md
 ```
 
 ## Build The Baseline Image
@@ -132,7 +146,7 @@ DOCKER_BUILDKIT=1 docker build \
 
 The build-time assertion checks that vLLM can see the FlashInfer B12x W4A16
 entrypoints. The Dockerfile also bakes the persistent compile-cache path,
-row-tiled logits top-k env defaults, row512/q2048 runtime env defaults,
+row-tiled logits top-k env defaults, row512/q4096 runtime env defaults,
 H8/D32/W4 stream fallback env defaults, and blocked sparse MLA accumulator env
 defaults listed in the recipe below, so future overlay images inherit this
 baseline even when the launch recipe does not restate every knob.
@@ -192,12 +206,14 @@ env:
   VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D: "32"
   VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS: "4"
   VLLM_TRITON_MLA_SPARSE: "1"
-  VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: "2048"
+  VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: "4096"
   VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE: "1024"
   VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM: "1"
   VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE: "1"
   VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C: "16"
   VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS: "8"
+  VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_WARPS: "4"
+  VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_STAGES: "2"
   VLLM_MARLIN_USE_ATOMIC_ADD: "1"
   VLLM_NCCL_SO_PATH: /usr/lib/aarch64-linux-gnu/libnccl.so.2
   NCCL_IB_DISABLE: "0"
@@ -238,7 +254,8 @@ sparkrun run /tmp/deepseek-v4-flash-gb10-rowtiled-logits-baseline.yaml --no-foll
 
 If reusing an older checked harness recipe, make sure it includes the
 combined-prefill and blocked-accumulator env vars above, uses `MAX_ROWS=512`,
-`QUERY_CHUNK_SIZE=2048`, `PREFILL_BLOCK_C=16`, `PREFILL_BLOCK_HEADS=8`, and
+`QUERY_CHUNK_SIZE=4096`, `PREFILL_BLOCK_C=16`, `PREFILL_BLOCK_HEADS=8`,
+`PREFILL_BLOCK_WARPS=4`, `PREFILL_BLOCK_STAGES=2`, and
 the row-tiled logits and H8/D32/W4 fallback topk512 env vars, and removes any
 `--profiler-config` unless you
 are intentionally taking a profile.
@@ -277,7 +294,7 @@ Required recipe evidence:
 
 ```bash
 sparkrun export running-recipe <cluster-id> | rg \
-  "BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|QUERY_CHUNK_SIZE|LOGITS_ROW|MAX_ROWS|TOPK512"
+  "BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|PREFILL_BLOCK_WARPS|PREFILL_BLOCK_STAGES|QUERY_CHUNK_SIZE|LOGITS_ROW|MAX_ROWS|TOPK512"
 ```
 
 Expected recipe evidence:
@@ -287,7 +304,9 @@ VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM: '1'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE: '1'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C: '16'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS: '8'
-VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: '2048'
+VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_WARPS: '4'
+VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_STAGES: '2'
+VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: '4096'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED: '1'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE: '512'
 VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: '512'
