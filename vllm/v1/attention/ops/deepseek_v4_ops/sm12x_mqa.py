@@ -21,6 +21,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_int_choice(name: str, default: int, choices: tuple[int, ...]) -> int:
+    value = _env_int(name, default)
+    if value in choices:
+        return value
+    return default
+
+
 def _fp8_mqa_topk_stream_k_tiles_per_launch(seq_len_kv: int, topk: int) -> int:
     requested = _env_int("VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES", 1)
     if requested <= 1:
@@ -33,6 +40,46 @@ def _fp8_mqa_topk_stream_k_tiles_per_launch(seq_len_kv: int, topk: int) -> int:
     if seq_len_kv < max(topk * 16, min_kv_tokens * 2):
         return 1
     return min(requested, 2)
+
+
+def _fp8_mqa_topk_stream_config(topk: int) -> tuple[int, int, int]:
+    default_block_h = 4 if topk >= 2048 else 8
+    default_block_d = 16 if topk >= 2048 else 32
+    default_num_warps = 8
+    topk_suffix = "TOPK2048" if topk >= 2048 else "TOPK512"
+
+    block_h = _env_int_choice(
+        "VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_H",
+        default_block_h,
+        (1, 2, 4, 8),
+    )
+    block_d = _env_int_choice(
+        "VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_D",
+        default_block_d,
+        (16, 32, 64),
+    )
+    num_warps = _env_int_choice(
+        "VLLM_SM12X_MQA_TOPK_TRITON_NUM_WARPS",
+        default_num_warps,
+        (4, 8),
+    )
+
+    block_h = _env_int_choice(
+        f"VLLM_SM12X_MQA_TOPK_TRITON_{topk_suffix}_BLOCK_H",
+        block_h,
+        (1, 2, 4, 8),
+    )
+    block_d = _env_int_choice(
+        f"VLLM_SM12X_MQA_TOPK_TRITON_{topk_suffix}_BLOCK_D",
+        block_d,
+        (16, 32, 64),
+    )
+    num_warps = _env_int_choice(
+        f"VLLM_SM12X_MQA_TOPK_TRITON_{topk_suffix}_NUM_WARPS",
+        num_warps,
+        (4, 8),
+    )
+    return block_h, block_d, num_warps
 
 
 def _view_packed_fp8_paged_mqa_kv_cache(
@@ -416,8 +463,7 @@ def fp8_mqa_topk_indices_triton(
     best_values.fill_(float("-inf"))
     out.fill_(-1)
 
-    block_h = 4 if topk >= 2048 else 8
-    block_d = 16 if topk >= 2048 else 32
+    block_h, block_d, num_warps = _fp8_mqa_topk_stream_config(topk)
     k_tiles_per_launch = _fp8_mqa_topk_stream_k_tiles_per_launch(seq_len_kv, topk)
     kv_tile_width = topk * k_tiles_per_launch
     for tile_start in range(0, seq_len_kv, kv_tile_width):
@@ -448,7 +494,7 @@ def fp8_mqa_topk_indices_triton(
             BLOCK_D=block_d,
             BLOCK_H=block_h,
             K_TILES_PER_LAUNCH=k_tiles_per_launch,
-            num_warps=8,
+            num_warps=num_warps,
         )
     return True
 

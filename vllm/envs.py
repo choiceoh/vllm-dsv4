@@ -187,6 +187,15 @@ if TYPE_CHECKING:
     VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: int = 256
     VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: int = 8192
     VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES: int = 1
+    VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_H: int | None = None
+    VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_D: int | None = None
+    VLLM_SM12X_MQA_TOPK_TRITON_NUM_WARPS: int | None = None
+    VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H: int | None = None
+    VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D: int | None = None
+    VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS: int | None = None
+    VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_BLOCK_H: int | None = None
+    VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_BLOCK_D: int | None = None
+    VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_NUM_WARPS: int | None = None
     VLLM_DEEP_GEMM_WARMUP: Literal[
         "skip",
         "full",
@@ -1396,6 +1405,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES": lambda: env_int_or_default(
         "VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES", 1
+    ),
+    "VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_H": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_H")
+    ),
+    "VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_D": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_D")
+    ),
+    "VLLM_SM12X_MQA_TOPK_TRITON_NUM_WARPS": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_NUM_WARPS")
+    ),
+    "VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H")
+    ),
+    "VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D")
+    ),
+    "VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS")
+    ),
+    "VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_BLOCK_H": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_BLOCK_H")
+    ),
+    "VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_BLOCK_D": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_BLOCK_D")
+    ),
+    "VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_NUM_WARPS": lambda: maybe_convert_int(
+        os.getenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_NUM_WARPS")
     ),
     # DeepGemm JITs the kernels on-demand. The warmup attempts to make DeepGemm
     # JIT all the required kernels before model execution so there is no

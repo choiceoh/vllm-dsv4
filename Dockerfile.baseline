@@ -1,6 +1,6 @@
 # Baseline image for DeepSeek V4 Flash on GB10 with the local SM12x static MLA
-# path, blocked sparse MLA prefill accumulation, combined prefill opts, and
-# FlashInfer B12x W4A16 MoE enabled.
+# path, H8/D32/W4 topk512 stream scheduling, blocked sparse MLA prefill
+# accumulation, combined prefill opts, and FlashInfer B12x W4A16 MoE enabled.
 #
 # Build from the workspace root, not from the vLLM repo root, because this
 # Dockerfile copies both ./vllm and the sibling ./flashinfer-latest checkout:
@@ -13,8 +13,8 @@
 ARG BASE_IMAGE=sparkrun-vllm-ds4-gb10:ae353d502-static-mla-dirty-20260518T000139Z-cuda13.2-nccl2.30-vllm-openai-base
 FROM ${BASE_IMAGE}
 
-LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 blocked sparse MLA baseline"
-LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, blocked sparse MLA prefill accumulation, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
+LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 H8D32W4 prefill baseline"
+LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, H8/D32/W4 topk512 stream scheduling, blocked sparse MLA prefill accumulation, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
 
 ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     VLLM_SM12X_MQA_TOPK_TRITON=1 \
@@ -22,10 +22,14 @@ ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512 \
     VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS=8192 \
     VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES=2 \
+    VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H=8 \
+    VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D=32 \
+    VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS=4 \
     VLLM_TRITON_MLA_SPARSE=1 \
     VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE=2048 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE=1024 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM=1 \
+    VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE=1 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C=16 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS=8 \
     VLLM_MARLIN_USE_ATOMIC_ADD=1

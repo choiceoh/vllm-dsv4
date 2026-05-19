@@ -1,7 +1,7 @@
-# DeepSeek V4 Flash GB10 Blocked Sparse MLA Baseline Setup
+# DeepSeek V4 Flash GB10 H8D32W4 Prefill Baseline Setup
 
 This baseline captures the working two-node GB10 setup validated on
-2026-05-18. It is meant to be a stable starting image for future agents so they
+2026-05-19. It is meant to be a stable starting image for future agents so they
 can build one baseline image and then layer experiments on top of that image.
 
 ## What This Baseline Contains
@@ -14,43 +14,75 @@ can build one baseline image and then layer experiments on top of that image.
 - FlashInfer commit: `a52ad3a649ab3716efe738be24e837566117d2b3`
 - Model: `deepseek-ai/DeepSeek-V4-Flash`
 - Runtime shape: TP=2, PP=1, EP enabled, MTP=2, fp8 KV
-- Context shape: `max_model_len=131072`, `max_num_batched_tokens=8192`, `max_num_seqs=1`
+- Context shape: `max_model_len=262144`, `max_num_batched_tokens=8192`, `max_num_seqs=1`
 - MoE backend: `FLASHINFER_B12X_MXFP4_BF16`
 - Static MLA/MQA path: `VLLM_SM12X_MQA_TOPK_TRITON=1`
 - Combined prefill opts:
   `VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512`,
   `VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES=2`,
+  `VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H=8`,
+  `VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D=32`,
+  `VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS=4`,
   `VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE=2048`, and
   `VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE=1024`
 - Blocked sparse MLA prefill accumulator enabled in the baseline image and
   recipe:
   `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM=1`,
+  `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE=1`,
   `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C=16`, and
   `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS=8`
 
 The source-level blocked accumulator knob remains default-off. This baseline
 opts in through the Dockerfile and launch recipe after service-level validation.
 
-The validated warm measured results for this setup were:
+The validated warm measured prefill ruler for this setup was:
 
-- 32k request: `501.74 tok/s` server prefill, `44.83 tok/s` server decode
-- 64k request: `701.39 tok/s` server prefill, `37.73 tok/s` server decode
-- 128k request: `711.91 tok/s` server prefill, `37.59 tok/s` server decode
-- Prefix cache hits: `0` for every warmup and measured leg
+| context | measured prefill tok/s | prefill seconds |
+| ---: | ---: | ---: |
+| 1k | 1146.11 | 0.87 |
+| 4k | 1318.31 | 3.03 |
+| 8k | 1274.45 | 6.28 |
+| 16k | 1270.87 | 12.59 |
+| 32k | 1232.91 | 25.95 |
+| 64k | 1000.59 | 63.96 |
+| 96k | 844.10 | 113.73 |
+| 128k | 750.71 | 170.51 |
+| 160k | 690.99 | 231.55 |
+| 200k | 665.31 | 300.61 |
 
-Compared to the previous row512/q2048 combined-prefill baseline:
+All measured ruler legs used `max_tokens=1`, returned status 200, had prefix
+cache hits delta `0`, and reported computed prefill tokens equal to the prompt
+size.
 
-- 32k measured prefill: `+10.38%`; decode: `+0.20%`
-- 128k measured prefill: `+27.19%`; decode: `+1.25%`
+Compared to the prior hybrid MQA logits 200k profile baseline, the H8/D32/W4
+topk512 candidate improved the warm profiled 200k request from `609.22 tok/s`
+to `632.84 tok/s` and reduced rank0 `_fp8_mqa_topk_stream_kernel` time by
+`17.04%`. The no-profiler ruler measured `665.31 tok/s` at 200k.
 
-This promotes row512/q2048 plus blocked sparse MLA accumulation as the baseline
-because measured warm prefill improves at 32k, 64k, and 128k without a measured
-decode regression in this run.
+The same live baseline server also passed the long-context haystack retrieval
+probe at both 128k and 200k:
+
+| target | prompt lines | prompt tokens | completion tokens | elapsed seconds | result |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 128k | 4225 | 131032 | 69 | 198.78 | matched all sentinel terms |
+| 200k | 6455 | 200162 | 52 | 319.07 | matched all sentinel terms |
+
+The 128k haystack run was the first post-launch long request and showed
+first-use Triton JIT warnings for metadata, logits, top-k, attention, and MoE
+kernels. The 200k haystack was run immediately afterward on the same server.
+
+This promotes row512/q2048 plus blocked sparse MLA accumulation plus H8/D32/W4
+topk512 stream scheduling as the baseline. The optimization does not reduce
+`topk`; it only changes the Triton scheduling shape for topk512.
 
 The full benchmark artifact is:
 
 ```text
 /home/aidendle94/Documents/workspace/experiment_runs/blocked_accum_20260518T092400Z/report.md
+/home/aidendle94/Documents/workspace/experiment_runs/topk_h8d32w4_profile_200k_20260519T014917Z/report.md
+/home/aidendle94/Documents/workspace/experiment_runs/topk_h8d32w4_prefill_ruler_20260519T024613Z/report.md
+/home/aidendle94/Documents/workspace/experiment_runs/topk_h8d32w4_haystack_20260519T034225Z/128k/long_context_probe.md
+/home/aidendle94/Documents/workspace/experiment_runs/topk_h8d32w4_haystack_20260519T034225Z/200k/long_context_probe.md
 ```
 
 ## Build The Baseline Image
@@ -65,7 +97,7 @@ export WORKSPACE=/home/aidendle94/Documents/workspace
 export VLLM_ROOT=${WORKSPACE}/vllm
 export BASE_IMAGE=sparkrun-vllm-ds4-gb10:ae353d502-static-mla-dirty-20260518T000139Z-cuda13.2-nccl2.30-vllm-openai-base
 export BASELINE_REF=$(git -C "${VLLM_ROOT}" rev-parse --short HEAD)
-export BASELINE_IMAGE=sparkrun-vllm-ds4-gb10:${BASELINE_REF}-blocked-sparse-mla-baseline-cuda13.2-nccl2.30-vllm-openai-base
+export BASELINE_IMAGE=sparkrun-vllm-ds4-gb10:${BASELINE_REF}-h8d32w4-prefill-baseline-cuda13.2-nccl2.30-vllm-openai-base
 
 git -C "${VLLM_ROOT}" merge-base --is-ancestor 5b5b63ded HEAD
 test "$(git -C "${WORKSPACE}/flashinfer-latest" rev-parse HEAD)" = "a52ad3a649ab3716efe738be24e837566117d2b3"
@@ -78,10 +110,10 @@ DOCKER_BUILDKIT=1 docker build \
 ```
 
 The build-time assertion checks that vLLM can see the FlashInfer B12x W4A16
-entrypoints. The Dockerfile also bakes the row512/q2048 runtime env defaults
-and blocked sparse MLA accumulator env defaults listed in the recipe below, so
-future overlay images inherit this baseline even when the launch recipe does
-not restate every knob.
+entrypoints. The Dockerfile also bakes the row512/q2048 runtime env defaults,
+H8/D32/W4 topk512 stream env defaults, and blocked sparse MLA accumulator env
+defaults listed in the recipe below, so future overlay images inherit this
+baseline even when the launch recipe does not restate every knob.
 
 ```python
 from vllm.utils.flashinfer import has_flashinfer_b12x_fused_moe
@@ -97,11 +129,11 @@ only when intentionally testing a descendant image.
 
 ```yaml
 recipe_version: "1"
-name: DeepSeek V4 Flash GB10 blocked sparse MLA baseline
-description: DeepSeek V4 Flash GB10 baseline with FlashInfer B12x W4A16, static SM12x MQA top-k, blocked sparse MLA prefill accumulation, combined prefill opts, MTP=2, and 128k context.
+name: DeepSeek V4 Flash GB10 H8D32W4 prefill baseline
+description: DeepSeek V4 Flash GB10 baseline with FlashInfer B12x W4A16, static SM12x MQA top-k, H8/D32/W4 topk512 scheduling, blocked sparse MLA prefill accumulation, combined prefill opts, MTP=2, and 262k context.
 runtime: vllm-distributed
 model: deepseek-ai/DeepSeek-V4-Flash
-container: sparkrun-vllm-ds4-gb10:<commit>-blocked-sparse-mla-baseline-cuda13.2-nccl2.30-vllm-openai-base
+container: sparkrun-vllm-ds4-gb10:<commit>-h8d32w4-prefill-baseline-cuda13.2-nccl2.30-vllm-openai-base
 cluster_only: true
 min_nodes: 2
 max_nodes: 2
@@ -112,7 +144,7 @@ defaults:
   tensor_parallel: 2
   pipeline_parallel: 1
   gpu_memory_utilization: 0.85
-  max_model_len: 131072
+  max_model_len: 262144
   max_num_batched_tokens: 8192
   max_num_seqs: 1
   block_size: 256
@@ -128,10 +160,14 @@ env:
   VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: "512"
   VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: "8192"
   VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES: "2"
+  VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H: "8"
+  VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D: "32"
+  VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS: "4"
   VLLM_TRITON_MLA_SPARSE: "1"
   VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: "2048"
   VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE: "1024"
   VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM: "1"
+  VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE: "1"
   VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C: "16"
   VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS: "8"
   VLLM_MARLIN_USE_ATOMIC_ADD: "1"
@@ -169,18 +205,19 @@ Launch it:
 
 ```bash
 cd /home/aidendle94/Documents/workspace/vllm-ds4-sm120-harness
-sparkrun run /tmp/deepseek-v4-flash-gb10-blocked-sparse-mla-baseline.yaml --no-follow
+sparkrun run /tmp/deepseek-v4-flash-gb10-h8d32w4-prefill-baseline.yaml --no-follow
 ```
 
 If reusing an older checked harness recipe, make sure it includes the
 combined-prefill and blocked-accumulator env vars above, uses `MAX_ROWS=512`,
-`QUERY_CHUNK_SIZE=2048`, `PREFILL_BLOCK_C=16`, and `PREFILL_BLOCK_HEADS=8`, and
-removes any `--profiler-config` unless you are intentionally taking a profile.
+`QUERY_CHUNK_SIZE=2048`, `PREFILL_BLOCK_C=16`, `PREFILL_BLOCK_HEADS=8`, and
+the H8/D32/W4 topk512 env vars, and removes any `--profiler-config` unless you
+are intentionally taking a profile.
 The old static-MLA profile recipe is not the clean throughput baseline by
 itself.
 
 ```bash
-rg "MAX_ROWS|STREAM_K_TILES|QUERY_CHUNK|PREFILL_TOPK_CHUNK|BLOCKED_ACCUM|BLOCK_C|BLOCK_HEADS|profiler-config" sparkrun/*.yaml
+rg "MAX_ROWS|STREAM_K_TILES|TOPK512|QUERY_CHUNK|PREFILL_TOPK_CHUNK|BLOCKED_ACCUM|BLOCK_C|BLOCK_HEADS|profiler-config" sparkrun/*.yaml
 ```
 
 ## Validation
@@ -211,17 +248,21 @@ Required recipe evidence:
 
 ```bash
 sparkrun export running-recipe <cluster-id> | rg \
-  "BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|QUERY_CHUNK_SIZE|MAX_ROWS"
+  "BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|QUERY_CHUNK_SIZE|MAX_ROWS|TOPK512"
 ```
 
 Expected recipe evidence:
 
 ```text
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM: '1'
+VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE: '1'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C: '16'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS: '8'
 VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: '2048'
 VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: '512'
+VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H: '8'
+VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D: '32'
+VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS: '4'
 ```
 
 The first long request may still show a Triton JIT warning for

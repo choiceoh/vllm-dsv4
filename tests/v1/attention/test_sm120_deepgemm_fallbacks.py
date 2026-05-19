@@ -345,6 +345,47 @@ def test_sm120_triton_prefill_mqa_topk_stream_tile_guard(
     assert _fp8_mqa_topk_stream_k_tiles_per_launch(131072, 2048) == 1
 
 
+def test_sm120_triton_prefill_mqa_topk_stream_config(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
+        _fp8_mqa_topk_stream_config,
+    )
+
+    for name in (
+        "VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_H",
+        "VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_D",
+        "VLLM_SM12X_MQA_TOPK_TRITON_NUM_WARPS",
+        "VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H",
+        "VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D",
+        "VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS",
+        "VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_BLOCK_H",
+        "VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_BLOCK_D",
+        "VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_NUM_WARPS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert _fp8_mqa_topk_stream_config(512) == (8, 32, 8)
+    assert _fp8_mqa_topk_stream_config(2048) == (4, 16, 8)
+
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_H", "4")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_BLOCK_D", "64")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_NUM_WARPS", "4")
+    assert _fp8_mqa_topk_stream_config(512) == (4, 64, 4)
+    assert _fp8_mqa_topk_stream_config(2048) == (4, 64, 4)
+
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H", "2")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D", "16")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS", "8")
+    assert _fp8_mqa_topk_stream_config(512) == (2, 16, 8)
+    assert _fp8_mqa_topk_stream_config(2048) == (4, 64, 4)
+
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_BLOCK_H", "3")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_BLOCK_D", "bad")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_TOPK2048_NUM_WARPS", "16")
+    assert _fp8_mqa_topk_stream_config(2048) == (4, 64, 4)
+
+
 def test_triton_sparse_mla_prefill_topk_chunk_guard(
     monkeypatch: pytest.MonkeyPatch,
 ):
