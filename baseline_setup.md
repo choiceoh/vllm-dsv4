@@ -22,6 +22,10 @@ can build one baseline image and then layer experiments on top of that image.
 - MQA top-k baseline: row-tiled materialized logits enabled with
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED=1` and
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE=512`
+- Persistent compile cache: `VLLM_CACHE_ROOT=/cache/huggingface/vllm-cache`,
+  `TRITON_CACHE_DIR=/cache/huggingface/triton-cache`,
+  `TORCHINDUCTOR_CACHE_DIR=/cache/huggingface/torchinductor-cache`, and
+  `TRITON_CACHE_AUTOTUNING=1`
 - Combined prefill opts:
   `VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512`,
   `VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES=2`,
@@ -127,11 +131,11 @@ DOCKER_BUILDKIT=1 docker build \
 ```
 
 The build-time assertion checks that vLLM can see the FlashInfer B12x W4A16
-entrypoints. The Dockerfile also bakes the row-tiled logits top-k env defaults,
-row512/q2048 runtime env defaults, H8/D32/W4 stream fallback env defaults, and
-blocked sparse MLA accumulator env defaults listed in the recipe below, so
-future overlay images inherit this baseline even when the launch recipe does
-not restate every knob.
+entrypoints. The Dockerfile also bakes the persistent compile-cache path,
+row-tiled logits top-k env defaults, row512/q2048 runtime env defaults,
+H8/D32/W4 stream fallback env defaults, and blocked sparse MLA accumulator env
+defaults listed in the recipe below, so future overlay images inherit this
+baseline even when the launch recipe does not restate every knob.
 
 ```python
 from vllm.utils.flashinfer import has_flashinfer_b12x_fused_moe
@@ -171,6 +175,10 @@ defaults:
 
 env:
   TORCH_CUDA_ARCH_LIST: 12.1a
+  VLLM_CACHE_ROOT: /cache/huggingface/vllm-cache
+  TRITON_CACHE_DIR: /cache/huggingface/triton-cache
+  TRITON_CACHE_AUTOTUNING: "1"
+  TORCHINDUCTOR_CACHE_DIR: /cache/huggingface/torchinductor-cache
   VLLM_ENFORCE_STRICT_TOOL_CALLING: "1"
   VLLM_USE_FLASHINFER_MOE_B12X_W4A16: "1"
   VLLM_SM12X_MQA_TOPK_TRITON: "1"
@@ -213,7 +221,7 @@ command: |
     --distributed-executor-backend mp \
     --no-enable-flashinfer-autotune \
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
-    --speculative-config '{"method":"deepseek_mtp","num_speculative_tokens":2}' \
+    --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
     --tokenizer-mode deepseek_v4 \
     --tool-call-parser deepseek_v4 \
     --enable-auto-tool-choice \
@@ -288,10 +296,12 @@ VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D: '32'
 VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS: '4'
 ```
 
-The first long request may still show Triton JIT warnings for row-tiled logits,
-metadata, sparse MLA, MoE, or decode kernels if that exact shape was not covered
-by warmup. Treat the second request at the same context length as the warm
-measurement.
+Startup warmup should cover the row-tiled logits, sparse MLA metadata, MTP
+decode prep, and FlashInfer route-pack kernels before the JIT monitor is
+activated. If a new shape still appears, it should be written under
+`/cache/huggingface/vllm-cache` or `/cache/huggingface/triton-cache` so a
+container restart on the same image and host can reuse it instead of
+recompiling on the first user request.
 
 For 32k, 64k, and 128k benchmarks, use an uncached single request with exact
 prompt token IDs and 128 output tokens, then compute throughput from Prometheus

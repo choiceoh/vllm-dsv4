@@ -1141,7 +1141,17 @@ def build_c128a_topk_metadata(
     return global_decode, decode_lens, prefill_local
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "global_decode_stride",
+        "prefill_local_stride",
+        "compress_ratio",
+        "effective_topk",
+        "num_decode_tokens",
+        "block_table_stride",
+        "block_size",
+    ]
+)
 def _build_c128a_topk_metadata_kernel(
     # Decode outputs
     global_decode_ptr,

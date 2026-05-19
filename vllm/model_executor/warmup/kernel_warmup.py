@@ -56,6 +56,8 @@ _DEEPSEEK_V4_SLOT_MAPPING_WARMUP_TOKENS = tuple(range(1, 17)) + (
     256,
     512,
 )
+_DEEPSEEK_V4_METADATA_WARMUP_TOKENS = 16
+_DEEPSEEK_V4_ROUTE_PACK_WARMUP_TOKENS = (1, 3, 512)
 
 
 def _attention_backend_name(backend: object) -> str | None:
@@ -192,6 +194,379 @@ def _deepseek_v4_structured_output_bitmask_warmup(
             apply_grammar_bitmask(
                 SchedulerOutput.make_empty(), grammar_output, input_batch, logits
             )
+
+
+def _deepseek_v4_indexer_shape(runner: "GPUModelRunner") -> tuple[int, int, int]:
+    hf_config = runner.model_config.hf_config
+    num_heads = int(getattr(hf_config, "index_n_heads", 64))
+    head_dim = int(getattr(hf_config, "index_head_dim", 128))
+    topk = int(getattr(hf_config, "index_topk", 512))
+    return num_heads, head_dim, topk
+
+
+def _deepseek_v4_compress_ratios(runner: "GPUModelRunner") -> tuple[int, ...]:
+    hf_config = runner.model_config.hf_config
+    ratios = getattr(hf_config, "compress_ratios", None) or (128,)
+    return tuple(sorted({int(r) for r in ratios if int(r) > 0}))
+
+
+@torch.inference_mode()
+def _deepseek_v4_row_tiled_logits_warmup(runner: "GPUModelRunner") -> None:
+    if not (
+        envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP
+        and envs.VLLM_SM12X_MQA_TOPK_TRITON
+        and envs.VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED
+        and current_platform.is_cuda_alike()
+    ):
+        return
+
+    num_heads, head_dim, topk = _deepseek_v4_indexer_shape(runner)
+    if topk not in (512, 2048):
+        return
+
+    row_tile = min(
+        max(1, envs.VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE),
+        max(1, worker_max_tokens := runner.max_num_tokens),
+    )
+    min_kv_tokens = max(1, envs.VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS)
+    kv_tokens = min(max(min_kv_tokens, topk * 16), worker_max_tokens)
+    if kv_tokens < min_kv_tokens:
+        return
+
+    try:
+        from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_deep_gemm_fallbacks import (
+            fp8_fp4_mqa_topk_indices,
+        )
+
+        device = runner.device
+        q = torch.zeros(
+            (row_tile, num_heads, head_dim), dtype=torch.bfloat16, device=device
+        )
+        k = torch.zeros((kv_tokens, head_dim), dtype=torch.float8_e4m3fn, device=device)
+        scale = torch.ones((kv_tokens,), dtype=torch.float32, device=device)
+        weights = torch.full(
+            (row_tile, num_heads),
+            1.0 / max(1, num_heads),
+            dtype=torch.float32,
+            device=device,
+        )
+        cu_seqlen_ks = torch.zeros(row_tile, dtype=torch.int32, device=device)
+        cu_seqlen_ke = torch.full(
+            (row_tile,), kv_tokens, dtype=torch.int32, device=device
+        )
+        out = torch.empty((row_tile, topk), dtype=torch.int32, device=device)
+
+        logger.info(
+            "Warming up DeepSeek V4 row-tiled MQA logits top-k "
+            "(rows=%d, kv_tokens=%d, heads=%d, head_dim=%d, topk=%d).",
+            row_tile,
+            kv_tokens,
+            num_heads,
+            head_dim,
+            topk,
+        )
+        used = fp8_fp4_mqa_topk_indices(
+            (q, None),
+            (k, scale),
+            weights,
+            cu_seqlen_ks,
+            cu_seqlen_ke,
+            out,
+        )
+        if not used:
+            logger.warning_once(
+                "DeepSeek V4 row-tiled MQA logits top-k warmup did not use "
+                "the Triton path."
+            )
+    except Exception:
+        logger.warning_once(
+            "DeepSeek V4 row-tiled MQA logits top-k warmup failed.",
+            exc_info=True,
+        )
+
+
+@torch.inference_mode()
+def _deepseek_v4_sparse_mla_metadata_warmup(runner: "GPUModelRunner") -> None:
+    if not (
+        envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP
+        and current_platform.is_cuda_alike()
+    ):
+        return
+
+    try:
+        from vllm.v1.attention.backends.mla.flashmla_sparse import (
+            build_c128a_topk_metadata,
+        )
+        from vllm.v1.attention.backends.mla.indexer import (
+            build_prefill_chunk_metadata,
+        )
+        from vllm.v1.attention.ops.deepseek_v4_ops.cache_utils import (
+            combine_topk_swa_indices,
+        )
+
+        device = runner.device
+        block_size = int(getattr(runner.cache_config, "block_size", None) or 256)
+        _, _, topk = _deepseek_v4_indexer_shape(runner)
+        max_compressed_tokens = max(topk, 8192)
+        window_size = int(
+            getattr(runner.model_config.hf_config, "sliding_window", None) or 128
+        )
+        num_tokens = min(_DEEPSEEK_V4_METADATA_WARMUP_TOKENS, runner.max_num_tokens)
+        if num_tokens <= 0:
+            return
+
+        logger.info(
+            "Warming up DeepSeek V4 sparse MLA metadata kernels for "
+            "compress_ratios=%s.",
+            list(_deepseek_v4_compress_ratios(runner)),
+        )
+        for compress_ratio in _deepseek_v4_compress_ratios(runner):
+            warm_pos = compress_ratio * max_compressed_tokens - 1
+            positions = torch.full(
+                (num_tokens,), warm_pos, dtype=torch.int64, device=device
+            )
+            token_to_req = torch.zeros(num_tokens, dtype=torch.int32, device=device)
+            block_columns = warm_pos // block_size + 2
+            block_table = torch.zeros((1, block_columns), dtype=torch.int32, device=device)
+            slot_mapping = torch.zeros(num_tokens, dtype=torch.int64, device=device)
+
+            global_decode_buffer = torch.empty(
+                (num_tokens, max_compressed_tokens), dtype=torch.int32, device=device
+            )
+            decode_lens_buffer = torch.empty(num_tokens, dtype=torch.int32, device=device)
+            prefill_buffer = torch.empty(
+                (num_tokens, max_compressed_tokens), dtype=torch.int32, device=device
+            )
+            build_c128a_topk_metadata(
+                positions,
+                compress_ratio,
+                0,
+                token_to_req,
+                block_table,
+                block_size,
+                slot_mapping,
+                global_decode_buffer,
+                decode_lens_buffer,
+                prefill_buffer,
+                max_compressed_tokens=max_compressed_tokens,
+            )
+            build_c128a_topk_metadata(
+                positions,
+                compress_ratio,
+                min(2, num_tokens),
+                token_to_req,
+                block_table,
+                block_size,
+                slot_mapping,
+                global_decode_buffer,
+                decode_lens_buffer,
+                prefill_buffer,
+                max_compressed_tokens=max_compressed_tokens,
+            )
+
+            query_len = min(8192, runner.max_num_tokens)
+            query_start_loc_cpu = torch.tensor([0, query_len], dtype=torch.int32)
+            query_start_loc = query_start_loc_cpu.to(device)
+            uncompressed_seq_lens = torch.tensor(
+                [query_len * 2], dtype=torch.int32, device=device
+            )
+            compressed_seq_lens_cpu = torch.tensor(
+                [max(1, (query_len * 2) // compress_ratio)], dtype=torch.int32
+            )
+            compressed_seq_lens = compressed_seq_lens_cpu.to(device)
+            build_prefill_chunk_metadata(
+                0,
+                1,
+                query_start_loc,
+                query_start_loc_cpu,
+                uncompressed_seq_lens,
+                compressed_seq_lens,
+                compressed_seq_lens_cpu,
+                block_table,
+                compress_ratio,
+                query_slice=slice(0, query_len),
+                skip_kv_gather=True,
+            )
+
+            topk_indices = torch.full(
+                (num_tokens, topk), -1, dtype=torch.int32, device=device
+            )
+            topk_indices[:, : min(topk, 16)] = torch.arange(
+                min(topk, 16), dtype=torch.int32, device=device
+            )
+            query_start_loc_small = torch.tensor(
+                [0, num_tokens], dtype=torch.int32, device=device
+            )
+            seq_lens = torch.full(
+                (1,), query_len * 2, dtype=torch.int32, device=device
+            )
+            gather_lens = torch.full((1,), query_len, dtype=torch.int32, device=device)
+            combine_topk_swa_indices(
+                topk_indices,
+                query_start_loc_small,
+                seq_lens,
+                gather_lens,
+                window_size,
+                compress_ratio,
+                topk,
+                num_tokens,
+                topk,
+            )
+    except Exception:
+        logger.warning_once(
+            "DeepSeek V4 sparse MLA metadata warmup failed.",
+            exc_info=True,
+        )
+
+
+@torch.inference_mode()
+def _deepseek_v4_sparse_mla_swa_decode_warmup(runner: "GPUModelRunner") -> None:
+    if not (
+        envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP
+        and current_platform.is_cuda_alike()
+    ):
+        return
+
+    try:
+        from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
+            fp8ds_paged_sparse_mla_attention_with_sink_multihead,
+            sparse_mla_decode_head_block_size,
+        )
+
+        hf_config = runner.model_config.hf_config
+        device = runner.device
+        block_size = int(getattr(runner.cache_config, "block_size", None) or 256)
+        num_heads, _, _ = _deepseek_v4_indexer_shape(runner)
+        head_dim = 512
+        token_fp8_dim = 448
+        token_bf16_dim = 64
+        token_scale_dim = 8
+        token_data_size = token_fp8_dim + token_bf16_dim * 2
+        window_size = int(getattr(hf_config, "sliding_window", None) or 128)
+        num_decode_tokens = 1
+        num_candidates = min(max(1, window_size), block_size)
+
+        q = torch.zeros(
+            (num_decode_tokens, num_heads, head_dim),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        k_cache = torch.zeros(
+            (1, block_size, token_data_size + token_scale_dim),
+            dtype=torch.uint8,
+            device=device,
+        )
+        seq_lens = torch.full(
+            (num_decode_tokens,), num_candidates, dtype=torch.int32, device=device
+        )
+        gather_lens = torch.full_like(seq_lens, num_candidates)
+        block_table = torch.zeros((num_decode_tokens, 1), dtype=torch.int32, device=device)
+        attn_sink = torch.full((num_heads,), -float("inf"), dtype=torch.float32, device=device)
+        output = torch.empty(
+            (num_decode_tokens, num_heads, head_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        logger.info(
+            "Warming up DeepSeek V4 sparse MLA SWA decode kernel "
+            "(tokens=%d, candidates=%d, heads=%d).",
+            num_decode_tokens,
+            num_candidates,
+            num_heads,
+        )
+        fp8ds_paged_sparse_mla_attention_with_sink_multihead(
+            q=q,
+            k_cache=k_cache,
+            seq_lens=seq_lens,
+            gather_lens=gather_lens,
+            block_table=block_table,
+            block_size=block_size,
+            candidate_offset=0,
+            num_candidates=num_candidates,
+            scale=1.0,
+            attn_sink=attn_sink,
+            output=output,
+            head_block_size=sparse_mla_decode_head_block_size(num_decode_tokens),
+            num_heads=num_heads,
+        )
+    except Exception:
+        logger.warning_once(
+            "DeepSeek V4 sparse MLA SWA decode warmup failed.",
+            exc_info=True,
+        )
+
+
+@torch.inference_mode()
+def _deepseek_v4_flashinfer_b12x_route_pack_warmup(
+    runner: "GPUModelRunner",
+) -> None:
+    if not (
+        envs.VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP
+        and envs.VLLM_USE_FLASHINFER_MOE_B12X_W4A16
+        and current_platform.is_cuda_alike()
+    ):
+        return
+
+    try:
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_host import (
+            select_route_block_size_m,
+        )
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_route_pack import (
+            pack_topk_routes_by_expert,
+        )
+        from vllm.utils.flashinfer import has_flashinfer_b12x_fused_moe
+
+        if not has_flashinfer_b12x_fused_moe():
+            return
+
+        hf_config = runner.model_config.hf_config
+        topk = int(getattr(hf_config, "num_experts_per_tok", 6))
+        num_experts = int(getattr(hf_config, "n_routed_experts", 256))
+        token_counts = tuple(
+            sorted(
+                {
+                    t
+                    for t in (
+                        *_DEEPSEEK_V4_ROUTE_PACK_WARMUP_TOKENS,
+                        runner.max_num_tokens,
+                    )
+                    if t > 0
+                }
+            )
+        )
+
+        device = runner.device
+        expert_map = torch.arange(num_experts, dtype=torch.int32, device=device)
+        logger.info(
+            "Warming up FlashInfer B12x W4A16 route-pack kernels for "
+            "token_counts=%s.",
+            list(token_counts),
+        )
+        for num_tokens in token_counts:
+            topk_ids = (
+                torch.arange(num_tokens * topk, dtype=torch.int32, device=device)
+                .remainder(num_experts)
+                .reshape(num_tokens, topk)
+            )
+            block_size = select_route_block_size_m(num_tokens, topk, num_experts)
+            pack_topk_routes_by_expert(
+                topk_ids,
+                block_size,
+                num_experts,
+                expert_map=expert_map,
+            )
+            pack_topk_routes_by_expert(
+                topk_ids,
+                block_size,
+                num_experts,
+                expert_map=None,
+            )
+    except Exception:
+        logger.warning_once(
+            "FlashInfer B12x W4A16 route-pack warmup failed.",
+            exc_info=True,
+        )
 
 
 @torch.inference_mode()
@@ -469,6 +844,10 @@ def kernel_warmup(worker: "Worker"):
     )
 
     _deepseek_v4_sparse_mla_attention_warmup(worker)
+    _deepseek_v4_row_tiled_logits_warmup(worker.model_runner)
+    _deepseek_v4_sparse_mla_metadata_warmup(worker.model_runner)
+    _deepseek_v4_sparse_mla_swa_decode_warmup(worker.model_runner)
+    _deepseek_v4_flashinfer_b12x_route_pack_warmup(worker.model_runner)
     _deepseek_v4_request_prep_warmup(worker)
 
     enable_flashinfer_autotune = (

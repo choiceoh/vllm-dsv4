@@ -22,6 +22,7 @@ from vllm.triton_utils.importing import HAS_TRITON
 logger = init_logger(__name__)
 
 _active: bool = False
+_last_compile_event: tuple[str | None, bool] | None = None
 
 
 def is_active() -> bool:
@@ -49,6 +50,7 @@ def activate() -> None:
     _active = True
 
     _setup_triton_autotuning_print()
+    _setup_triton_compile_listener()
     _setup_triton_jit_hook()
 
     logger.info(
@@ -84,6 +86,28 @@ def _setup_triton_autotuning_print() -> None:
 # ------------------------------------------------------------------
 
 
+def _setup_triton_compile_listener() -> None:
+    """Track whether Triton's latest compile call hit the persistent cache."""
+    if not HAS_TRITON:
+        return
+    from triton import knobs  # type: ignore[import-untyped]
+
+    existing_listener = knobs.compilation.listener
+
+    def _on_compile(**kwargs):
+        global _last_compile_event
+        src = kwargs.get("src")
+        _last_compile_event = (
+            getattr(src, "name", None),
+            bool(kwargs.get("cache_hit", False)),
+        )
+        if existing_listener is not None:
+            return existing_listener(**kwargs)
+        return None
+
+    knobs.compilation.listener = _on_compile
+
+
 def _setup_triton_jit_hook() -> None:
     """Register a ``jit_post_compile_hook`` that warns on compilation."""
     if not HAS_TRITON:
@@ -100,12 +124,18 @@ def _setup_triton_jit_hook() -> None:
         # pre-existing hook unchanged.
         fn = kwargs.get("fn")
         fn_name = getattr(fn, "name", "<unknown>")
-        logger.warning_once(
-            "Triton kernel JIT compilation during inference: %s. "
-            "This causes a latency spike; consider extending warmup "
-            "to cover this shape/config.",
-            fn_name,
-        )
+        if _last_compile_event == (fn_name, True):
+            logger.debug(
+                "Triton kernel loaded from persistent cache during inference: %s.",
+                fn_name,
+            )
+        else:
+            logger.warning_once(
+                "Triton kernel JIT compilation during inference: %s. "
+                "This causes a latency spike; consider extending warmup "
+                "to cover this shape/config.",
+                fn_name,
+            )
         if existing_hook is not None:
             return existing_hook(**kwargs)
         return None

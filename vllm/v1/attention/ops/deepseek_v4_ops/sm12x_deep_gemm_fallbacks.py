@@ -491,7 +491,7 @@ def _fp8_mqa_logits_topk_triton_row_tiled(
             out_copy_back.copy_(out_tile)
         tile_count += 1
 
-    logger.warning_once(
+    logger.info_once(
         "Using SM12x Triton materialized MQA logits top-k row-tiled path "
         "(q_rows=%s, row_tile=%s, row_tiles=%s, kv_tokens=%s, topk=%s).",
         row_count,

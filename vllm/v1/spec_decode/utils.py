@@ -25,7 +25,7 @@ def next_power_of_2(n: int) -> int:
     return n + 1
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["block_table_stride", "batch_size"])
 def eagle_step_slot_mapping_metadata_kernel(
     positions_ptr,  # [batch_size] - current positions (1D view for M-RoPE)
     block_table_ptr,  # [batch_size, n_blocks_per_req]
@@ -176,7 +176,14 @@ def eagle_prepare_inputs_padded_kernel(
     tl.store(num_rejected_tokens_gpu_ptr + req_idx, num_rejected_tokens)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=[
+        "vocab_size",
+        "num_sampled_tokens_per_req",
+        "num_reqs",
+        "stride_sampled_token_ids",
+    ]
+)
 def eagle_prepare_next_token_padded_kernel(
     sampled_token_ids_ptr,  # [num_reqs, num_sampled_tokens_per_req]
     discard_request_mask_ptr,  # [num_reqs]

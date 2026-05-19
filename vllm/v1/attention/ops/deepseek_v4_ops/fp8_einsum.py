@@ -14,14 +14,14 @@ from vllm.utils.deep_gemm import fp8_einsum
 from vllm.utils.torch_utils import direct_register_custom_op
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_tokens"])
 def _deepseek_v4_sm12x_fp8_einsum_kernel(
     a_ptr,
     a_scale_ptr,
     b_ptr,
     b_scale_ptr,
     out_ptr,
-    num_tokens: tl.constexpr,
+    num_tokens,
     num_groups: tl.constexpr,
     out_rank: tl.constexpr,
     hidden_size: tl.constexpr,

@@ -127,7 +127,7 @@ def _view_packed_fp8_paged_mqa_kv_cache(
     return kv_values, kv_scale[..., :scale_elems]
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_q", "seq_len_kv"])
 def _fp8_mqa_logits_kernel(
     q_ptr,
     k_ptr,
@@ -136,8 +136,8 @@ def _fp8_mqa_logits_kernel(
     cu_seqlen_ks_ptr,
     cu_seqlen_ke_ptr,
     logits_ptr,
-    num_q: tl.constexpr,
-    seq_len_kv: tl.constexpr,
+    num_q,
+    seq_len_kv,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     stride_qm: tl.constexpr,
@@ -920,13 +920,13 @@ def fp8_paged_mqa_logits_triton(
     return logits
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _tf32_hc_prenorm_gemm_kernel(
     x_ptr,
     fn_ptr,
     out_ptr,
     sqrsum_ptr,
-    M: tl.constexpr,
+    M,
     K: tl.constexpr,
     N: tl.constexpr,
     stride_xm: tl.constexpr,

@@ -17,6 +17,10 @@ if TYPE_CHECKING:
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
     VLLM_USE_MODELSCOPE: bool = False
     VLLM_RINGBUFFER_WARNING_INTERVAL: int = 60
+    VLLM_BUILD_URL: str | None = None
+    VLLM_IMAGE_TAG: str | None = None
+    VLLM_BUILD_PIPELINE: str | None = None
+    VLLM_BUILD_COMMIT: str | None = None
     VLLM_NCCL_SO_PATH: str | None = None
     LD_LIBRARY_PATH: str | None = None
     VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE: int = 256
@@ -658,6 +662,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_RINGBUFFER_WARNING_INTERVAL": lambda: int(
         os.environ.get("VLLM_RINGBUFFER_WARNING_INTERVAL", "60")
     ),
+    # Build metadata injected by local Docker/sparkrun recipes. These are
+    # intentionally ignored for compile-cache keys below.
+    "VLLM_BUILD_URL": lambda: os.getenv("VLLM_BUILD_URL"),
+    "VLLM_IMAGE_TAG": lambda: os.getenv("VLLM_IMAGE_TAG"),
+    "VLLM_BUILD_PIPELINE": lambda: os.getenv("VLLM_BUILD_PIPELINE"),
+    "VLLM_BUILD_COMMIT": lambda: os.getenv("VLLM_BUILD_COMMIT"),
     # path to cudatoolkit home directory, under which should be bin, include,
     # and lib directories.
     "CUDA_HOME": lambda: os.environ.get("CUDA_HOME", None),
@@ -2044,6 +2054,10 @@ def compile_factors() -> dict[str, object]:
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
+        "VLLM_BUILD_URL",
+        "VLLM_IMAGE_TAG",
+        "VLLM_BUILD_PIPELINE",
+        "VLLM_BUILD_COMMIT",
         "VLLM_DEBUG_DUMP_PATH",
         "VLLM_PORT",
         "VLLM_CACHE_ROOT",
