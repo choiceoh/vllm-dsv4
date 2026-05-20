@@ -21,6 +21,8 @@ and then layer experiments on top of that image.
   500000-token prompt plus one output token
 - MoE backend: `FLASHINFER_B12X_MXFP4_BF16`
 - Static MLA/MQA path: `VLLM_SM12X_MQA_TOPK_TRITON=1`
+- DeepSeek V4 thinking defaults are passed at launch with
+  `--default-chat-template-kwargs '{"thinking":true,"enable_thinking":true,"reasoning_effort":"high"}'`
 - MQA top-k baseline: row-tiled materialized logits enabled with
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED=1` and
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE=512`
@@ -42,12 +44,16 @@ and then layer experiments on top of that image.
   `TRITON_CACHE_AUTOTUNING=1`
 - Combined prefill opts:
   `VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512`,
+  `VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS=1`,
   `VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES=2`,
   `VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H=8`,
   `VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D=32`,
   `VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS=4`,
   `VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE=4096`, and
   `VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE=1024`
+- Small-context clamp removed:
+  `VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS=1` and
+  `VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_MIN_TOKENS=1`
 - Blocked sparse MLA prefill accumulator enabled in the baseline image and
   recipe:
   `VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM=1`,
@@ -70,6 +76,17 @@ The current M64 + stability + CUTeDSL warm measurements are:
 | 32k | 1 | 1248.08 | n/a | 0 | 0 / 0 |
 | 128k | 1 | 1092.09 | n/a | 0 | 0 / 0 |
 | 128k | 64 | 1120.66 | 35.80 | 0 | 44 / 42 |
+
+The small-context clamp removal was validated on 2026-05-20 with warm
+single-token requests against the same baseline image:
+
+| context | clamped prefill tok/s | unclamped prefill tok/s | delta |
+| ---: | ---: | ---: | ---: |
+| 1k | 1080.74 | 1152.94 | +6.7% |
+| 4k | 1245.84 | 1353.26 | +8.6% |
+| 8k | 1197.05 | 1313.18 | +9.7% |
+| 16k | 1185.94 | 1285.56 | +8.4% |
+| 32k | 1119.89 | 1255.07 | +12.1% |
 
 The tested pre-commit image was:
 
@@ -263,7 +280,7 @@ env:
   VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS: "4"
   VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS: "64"
   VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: "512"
-  VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: "8192"
+  VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: "1"
   VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES: "2"
   VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H: "8"
   VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D: "32"
@@ -271,6 +288,7 @@ env:
   VLLM_TRITON_MLA_SPARSE: "1"
   VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: "4096"
   VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE: "1024"
+  VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_MIN_TOKENS: "1"
   VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM: "1"
   VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE: "1"
   VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C: "16"
@@ -302,6 +320,7 @@ command: |
     --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
     --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
     --tokenizer-mode deepseek_v4 \
+    --default-chat-template-kwargs '{"thinking":true,"enable_thinking":true,"reasoning_effort":"high"}' \
     --tool-call-parser deepseek_v4 \
     --enable-auto-tool-choice \
     --reasoning-parser deepseek_v4 \
@@ -321,6 +340,7 @@ For 500k validation, use the same image and recipe but set
 
 If reusing an older checked harness recipe, make sure it includes the
 combined-prefill and blocked-accumulator env vars above, uses `MAX_ROWS=512`,
+`MIN_KV_TOKENS=1`, `PREFILL_TOPK_CHUNK_MIN_TOKENS=1`,
 `QUERY_CHUNK_SIZE=4096`, `PREFILL_BLOCK_C=16`, `PREFILL_BLOCK_HEADS=8`,
 `PREFILL_BLOCK_WARPS=4`, `PREFILL_BLOCK_STAGES=2`, and
 the row-tiled logits, M64 logits tile, and H8/D32/W4 fallback topk512 env vars,
@@ -361,7 +381,7 @@ Required recipe evidence:
 
 ```bash
 sparkrun export running-recipe <cluster-id> | rg \
-  "BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|PREFILL_BLOCK_WARPS|PREFILL_BLOCK_STAGES|QUERY_CHUNK_SIZE|LOGITS_ROW|LOGITS_BLOCK|MAX_ROWS|TOPK512"
+  "default-chat-template|MIN_KV_TOKENS|TOPK_CHUNK_MIN|BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|PREFILL_BLOCK_WARPS|PREFILL_BLOCK_STAGES|QUERY_CHUNK_SIZE|LOGITS_ROW|LOGITS_BLOCK|MAX_ROWS|TOPK512"
 ```
 
 Expected recipe evidence:
@@ -374,6 +394,7 @@ VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS: '8'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_WARPS: '4'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_STAGES: '2'
 VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: '4096'
+VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_MIN_TOKENS: '1'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED: '1'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE: '512'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M: '64'
@@ -381,6 +402,7 @@ VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N: '128'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D: '64'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS: '4'
 VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: '512'
+VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: '1'
 VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H: '8'
 VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D: '32'
 VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS: '4'
