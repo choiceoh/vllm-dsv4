@@ -1,4 +1,4 @@
-# DeepSeek V4 Flash GB10 M32 Row-Tiled Logits Baseline Setup
+# DeepSeek V4 Flash GB10 M64 Row-Tiled Logits Baseline Setup
 
 This baseline captures the working two-node GB10 setup validated on
 2026-05-19 and 2026-05-20. It is meant to be a stable starting image for
@@ -24,11 +24,18 @@ and then layer experiments on top of that image.
 - MQA top-k baseline: row-tiled materialized logits enabled with
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED=1` and
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE=512`
-- MQA logits tile baseline:
-  `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M=32`,
+- MQA logits tile experiment:
+  `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M=64`,
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N=128`,
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D=64`, and
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS=4`
+- FP8 Lightning Indexer path: uses the CUTeDSL fused-indexer implementation
+  when `cutlass` is importable, with the existing Triton FP8 indexer kept as
+  the fallback path.
+- Stability fixes: exact small MTP decode CUDA graph capture sizes, bounded
+  MTP uniform-decode warmup request counts, SWA decode-threshold alignment,
+  prefix-cache block protection for partially computed prompts, and cached
+  CUTeDSL availability probing.
 - Persistent compile cache: `VLLM_CACHE_ROOT=/cache/huggingface/vllm-cache`,
   `TRITON_CACHE_DIR=/cache/huggingface/triton-cache`,
   `TORCHINDUCTOR_CACHE_DIR=/cache/huggingface/torchinductor-cache`, and
@@ -55,7 +62,26 @@ opts in through the Dockerfile and launch recipe after service-level validation.
 The failed dynamic sparse-MLA candidate-cap experiment is intentionally absent
 from this baseline.
 
-The current q4096 row-tiled logits warm measurements are:
+The current M64 + stability + CUTeDSL warm measurements are:
+
+| context | max output | measured prefill tok/s | measured decode tok/s | prefix hits | MTP draft / accepted |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1k | 1 | 1149.52 | n/a | 0 | 0 / 0 |
+| 32k | 1 | 1248.08 | n/a | 0 | 0 / 0 |
+| 128k | 1 | 1092.09 | n/a | 0 | 0 / 0 |
+| 128k | 64 | 1120.66 | 35.80 | 0 | 44 / 42 |
+
+The tested pre-commit image was:
+
+```text
+sparkrun-vllm-ds4-gb10:53511e9c9-m64-stab-cutedsl-nooverlap-dirty-20260520T055057Z-cuda13.2-nccl2.30-vllm-openai-base
+```
+
+The rejected C128A gather/indexer overlap candidate is intentionally absent
+from this baseline. It failed during startup with `NameError: attn_metadata is
+not defined`.
+
+The prior M32 q4096 row-tiled logits warm measurements were:
 
 | context | max output | measured prefill tok/s | measured decode tok/s | prefix hits |
 | ---: | ---: | ---: | ---: | ---: |
@@ -122,7 +148,8 @@ The 128k haystack run was the first post-launch long request and showed
 first-use Triton JIT warnings for metadata, logits, top-k, attention, and MoE
 kernels. The 200k haystack was run immediately afterward on the same server.
 
-This promotes row512/q4096 plus blocked sparse MLA accumulation plus row-tiled
+This experimental stack promotes row512/q4096 plus blocked sparse MLA
+accumulation plus row-tiled
 materialized MQA logits top-k as the baseline. The optimization does not reduce
 `topk`; it computes exact topk512 over full logits in row tiles, with the
 streaming H8/D32/W4 path kept as the fallback for non-eligible shapes.
@@ -141,6 +168,7 @@ The full benchmark artifact is:
 /home/aidendle94/Documents/workspace/experiment_runs/blocked_tune_q4096_20260519T183400Z/report.md
 /home/aidendle94/Documents/workspace/experiment_runs/logits_m32_gsm8k_20260519T233515Z
 /home/aidendle94/Documents/workspace/experiment_runs/logits_m32_max500001_bench500k_20260520T002558Z/report.md
+/home/aidendle94/Documents/workspace/experiment_runs/m64_stab_cutedsl_nooverlap_20260520T060207Z/report.md
 ```
 
 ## Build The Baseline Image
@@ -160,7 +188,7 @@ set -euo pipefail
 export VLLM_ROOT=/home/aidendle94/Documents/workspace/vllm
 export BASE_IMAGE=sparkrun-vllm-ds4-gb10:ae353d502-static-mla-dirty-20260518T000139Z-cuda13.2-nccl2.30-vllm-openai-base
 export BASELINE_REF=$(git -C "${VLLM_ROOT}" rev-parse --short HEAD)
-export BASELINE_IMAGE=sparkrun-vllm-ds4-gb10:${BASELINE_REF}-m32-rowtiled-logits-baseline-cuda13.2-nccl2.30-vllm-openai-base
+export BASELINE_IMAGE=sparkrun-vllm-ds4-gb10:${BASELINE_REF}-m64-rowtiled-logits-baseline-cuda13.2-nccl2.30-vllm-openai-base
 
 git -C "${VLLM_ROOT}" diff --check
 
@@ -177,7 +205,7 @@ entrypoints. The Dockerfile pins FlashInfer to PR `3336` at commit
 `a52ad3a649ab3716efe738be24e837566117d2b3`; it does not depend on
 `/home/aidendle94/Documents/workspace/flashinfer-latest`. The Dockerfile also
 bakes the persistent compile-cache path, row-tiled logits top-k env defaults,
-M32 logits tile defaults, row512/q4096 runtime env defaults, H8/D32/W4 stream
+M64 logits tile defaults, row512/q4096 runtime env defaults, H8/D32/W4 stream
 fallback env defaults, and blocked sparse MLA accumulator env defaults listed
 in the recipe below, so future overlay images inherit this baseline even when
 the launch recipe does not restate every knob.
@@ -196,11 +224,11 @@ only when intentionally testing a descendant image.
 
 ```yaml
 recipe_version: "1"
-name: DeepSeek V4 Flash GB10 M32 row-tiled logits prefill baseline
-description: DeepSeek V4 Flash GB10 baseline with FlashInfer B12x W4A16, static SM12x MQA top-k, row-tiled materialized logits top-k, M32 logits tiling, blocked sparse MLA prefill accumulation, combined prefill opts, MTP=2, and 262k default context.
+name: DeepSeek V4 Flash GB10 M64 row-tiled logits prefill baseline
+description: DeepSeek V4 Flash GB10 baseline with FlashInfer B12x W4A16, static SM12x MQA top-k, row-tiled materialized logits top-k, M64 logits tiling, blocked sparse MLA prefill accumulation, combined prefill opts, MTP=2, and 262k default context.
 runtime: vllm-distributed
 model: deepseek-ai/DeepSeek-V4-Flash
-container: sparkrun-vllm-ds4-gb10:<commit>-m32-rowtiled-logits-baseline-cuda13.2-nccl2.30-vllm-openai-base
+container: sparkrun-vllm-ds4-gb10:<commit>-m64-rowtiled-logits-baseline-cuda13.2-nccl2.30-vllm-openai-base
 cluster_only: true
 min_nodes: 2
 max_nodes: 2
@@ -229,7 +257,7 @@ env:
   VLLM_SM12X_MQA_TOPK_TRITON: "1"
   VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED: "1"
   VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE: "512"
-  VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M: "32"
+  VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M: "64"
   VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N: "128"
   VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D: "64"
   VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS: "4"
@@ -284,7 +312,7 @@ Launch it:
 
 ```bash
 cd /home/aidendle94/Documents/workspace/vllm-ds4-sm120-harness
-sparkrun run /tmp/deepseek-v4-flash-gb10-m32-rowtiled-logits-baseline.yaml --no-follow
+sparkrun run /tmp/deepseek-v4-flash-gb10-m64-rowtiled-logits-baseline.yaml --no-follow
 ```
 
 For 500k validation, use the same image and recipe but set
@@ -295,7 +323,7 @@ If reusing an older checked harness recipe, make sure it includes the
 combined-prefill and blocked-accumulator env vars above, uses `MAX_ROWS=512`,
 `QUERY_CHUNK_SIZE=4096`, `PREFILL_BLOCK_C=16`, `PREFILL_BLOCK_HEADS=8`,
 `PREFILL_BLOCK_WARPS=4`, `PREFILL_BLOCK_STAGES=2`, and
-the row-tiled logits, M32 logits tile, and H8/D32/W4 fallback topk512 env vars,
+the row-tiled logits, M64 logits tile, and H8/D32/W4 fallback topk512 env vars,
 and removes any `--profiler-config` unless you are intentionally taking a
 profile.
 The old static-MLA profile recipe is not the clean throughput baseline by
@@ -348,7 +376,7 @@ VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_STAGES: '2'
 VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: '4096'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED: '1'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE: '512'
-VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M: '32'
+VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M: '64'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N: '128'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D: '64'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS: '4'

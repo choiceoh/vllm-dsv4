@@ -1,7 +1,7 @@
 # Baseline image for DeepSeek V4 Flash on GB10 with the local SM12x static MLA
 # path, row-tiled materialized MQA logits top-k, blocked sparse MLA prefill
-# accumulation, combined prefill opts, M32 logits tiling, and FlashInfer B12x
-# W4A16 MoE enabled.
+# accumulation, combined prefill opts, M64 logits tiling, CUTeDSL FP8 indexer
+# support, stability warmup fixes, and FlashInfer B12x W4A16 MoE enabled.
 #
 # Build from the vLLM repo root. The FlashInfer PR source is fetched by pinned
 # commit archive during the build, so this Dockerfile does not need a sibling
@@ -17,8 +17,8 @@ ARG FLASHINFER_COMMIT=a52ad3a649ab3716efe738be24e837566117d2b3
 FROM ${BASE_IMAGE}
 ARG FLASHINFER_COMMIT
 
-LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 M32 row-tiled logits prefill baseline"
-LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, row-tiled materialized MQA logits top-k, M32 logits tiling, blocked sparse MLA prefill accumulation, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
+LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 M64 row-tiled logits prefill baseline"
+LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, row-tiled materialized MQA logits top-k, M64 logits tiling, blocked sparse MLA prefill accumulation, CUTeDSL FP8 indexer support, stability warmup fixes, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
 
 ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     VLLM_CACHE_ROOT=/cache/huggingface/vllm-cache \
@@ -28,7 +28,7 @@ ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     VLLM_SM12X_MQA_TOPK_TRITON=1 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED=1 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE=512 \
-    VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M=32 \
+    VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M=64 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N=128 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D=64 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS=4 \
@@ -52,7 +52,9 @@ ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
 
 COPY vllm/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py
 COPY vllm/triton_utils/jit_monitor.py /usr/local/lib/python3.12/dist-packages/vllm/triton_utils/jit_monitor.py
+COPY vllm/config/compilation.py /usr/local/lib/python3.12/dist-packages/vllm/config/compilation.py
 COPY vllm/config/kernel.py /usr/local/lib/python3.12/dist-packages/vllm/config/kernel.py
+COPY vllm/utils/import_utils.py /usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py
 COPY vllm/utils/flashinfer.py /usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py
 COPY vllm/model_executor/layers/fused_moe/modular_kernel.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py
 COPY vllm/model_executor/layers/fused_moe/oracle/mxfp4.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
@@ -60,10 +62,15 @@ COPY vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py /usr/lo
 COPY vllm/model_executor/layers/deepseek_v4_attention.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/deepseek_v4_attention.py
 COPY vllm/model_executor/warmup/kernel_warmup.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py
 COPY vllm/tool_parsers/deepseekv32_tool_parser.py /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/deepseekv32_tool_parser.py
+COPY vllm/v1/core/single_type_kv_cache_manager.py /usr/local/lib/python3.12/dist-packages/vllm/v1/core/single_type_kv_cache_manager.py
+COPY vllm/v1/attention/backends/mla/sparse_swa.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py
 COPY vllm/v1/attention/backends/mla/sparse_mla_env.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py
 COPY vllm/v1/attention/backends/mla/flashmla_sparse.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
 COPY vllm/v1/attention/backends/mla/sparse_mla_kernels.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
 COPY vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py
+COPY vllm/v1/attention/ops/deepseek_v4_ops/cutedsl_utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/cutedsl_utils.py
+COPY vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py
+COPY vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q_cutedsl.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q_cutedsl.py
 COPY vllm/v1/attention/ops/deepseek_v4_ops/sm12x_deep_gemm_fallbacks.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_deep_gemm_fallbacks.py
 COPY vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py
 COPY vllm/v1/attention/ops/deepseek_v4_ops/fp8_einsum.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fp8_einsum.py
@@ -128,7 +135,9 @@ PY
 RUN python3 -m py_compile \
       /usr/local/lib/python3.12/dist-packages/vllm/envs.py \
       /usr/local/lib/python3.12/dist-packages/vllm/triton_utils/jit_monitor.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/config/compilation.py \
       /usr/local/lib/python3.12/dist-packages/vllm/config/kernel.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py \
       /usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py \
@@ -136,10 +145,15 @@ RUN python3 -m py_compile \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/deepseek_v4_attention.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py \
       /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/deepseekv32_tool_parser.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/v1/core/single_type_kv_cache_manager.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_kernels.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/cutedsl_utils.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q_cutedsl.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_deep_gemm_fallbacks.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fp8_einsum.py \

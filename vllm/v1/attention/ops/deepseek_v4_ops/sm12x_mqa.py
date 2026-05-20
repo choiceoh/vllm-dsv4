@@ -86,7 +86,7 @@ def _fp8_mqa_logits_config() -> tuple[int, int, int, int]:
     block_m = _env_int_choice(
         "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M",
         16,
-        (8, 16, 32),
+        (8, 16, 32, 64),
     )
     block_n = _env_int_choice(
         "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N",
