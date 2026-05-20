@@ -1,27 +1,34 @@
-# DeepSeek V4 Flash GB10 Row-Tiled Logits Baseline Setup
+# DeepSeek V4 Flash GB10 M32 Row-Tiled Logits Baseline Setup
 
 This baseline captures the working two-node GB10 setup validated on
-2026-05-19. It is meant to be a stable starting image for future agents so they
-can build one baseline image and then layer experiments on top of that image.
+2026-05-19 and 2026-05-20. It is meant to be a stable starting image for
+future agents so they can build one baseline image from this vLLM repository
+and then layer experiments on top of that image.
 
 ## What This Baseline Contains
 
 - vLLM branch: `production-baseline-20260515`
-- vLLM source savepoint: the commit or worktree state that contains this file,
-  the row-tiled logits change in `sm12x_deep_gemm_fallbacks.py`, and the
-  baseline Dockerfile update, descending from
-  `5b5b63ded docs: checkpoint flashinfer static mla baseline`
-- FlashInfer checkout: `/home/aidendle94/Documents/workspace/flashinfer-latest`
-- FlashInfer branch: `pr-3336-w4a16-rewrite`
+- vLLM source savepoint: the commit that contains this file and
+  `Dockerfile.baseline`
+- FlashInfer source: `https://github.com/flashinfer-ai/flashinfer.git`
+- FlashInfer ref: `refs/pull/3336/head`
 - FlashInfer commit: `a52ad3a649ab3716efe738be24e837566117d2b3`
 - Model: `deepseek-ai/DeepSeek-V4-Flash`
 - Runtime shape: TP=2, PP=1, EP enabled, MTP=2, fp8 KV
-- Context shape: `max_model_len=262144`, `max_num_batched_tokens=8192`, `max_num_seqs=1`
+- Default context shape: `max_model_len=262144`,
+  `max_num_batched_tokens=8192`, `max_num_seqs=1`
+- Extended-context validation shape: `max_model_len=500001` for a
+  500000-token prompt plus one output token
 - MoE backend: `FLASHINFER_B12X_MXFP4_BF16`
 - Static MLA/MQA path: `VLLM_SM12X_MQA_TOPK_TRITON=1`
 - MQA top-k baseline: row-tiled materialized logits enabled with
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED=1` and
   `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE=512`
+- MQA logits tile baseline:
+  `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M=32`,
+  `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N=128`,
+  `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D=64`, and
+  `VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS=4`
 - Persistent compile cache: `VLLM_CACHE_ROOT=/cache/huggingface/vllm-cache`,
   `TRITON_CACHE_DIR=/cache/huggingface/triton-cache`,
   `TORCHINDUCTOR_CACHE_DIR=/cache/huggingface/torchinductor-cache`, and
@@ -45,6 +52,8 @@ can build one baseline image and then layer experiments on top of that image.
 
 The source-level blocked accumulator knob remains default-off. This baseline
 opts in through the Dockerfile and launch recipe after service-level validation.
+The failed dynamic sparse-MLA candidate-cap experiment is intentionally absent
+from this baseline.
 
 The current q4096 row-tiled logits warm measurements are:
 
@@ -56,6 +65,18 @@ The current q4096 row-tiled logits warm measurements are:
 | 128k | 1 | 1062.85 | n/a | 0 |
 | 32k | 64 | 1153.17 | 41.35 | 0 |
 | 128k | 64 | 1051.81 | 36.34 | 0 |
+
+The promoted M32 logits-tile baseline preserved correctness on GSM8K and
+validated the 500k context path:
+
+| check | measured result | artifact |
+| --- | ---: | --- |
+| GSM8K 5-shot, limit 200 | 0.965 flexible EM, 0.955 strict EM | `/home/aidendle94/Documents/workspace/experiment_runs/logits_m32_gsm8k_20260519T233515Z` |
+| 500000-token prompt, `max_tokens=1`, `max_model_len=500001` | 668.129 prefill tok/s, prefix hits 0 | `/home/aidendle94/Documents/workspace/experiment_runs/logits_m32_max500001_bench500k_20260520T002558Z` |
+
+Exact `max_model_len=500000` rejected the 500000-token prompt with
+`max_tokens=1` because the requested total context was 500001. Use 500001 for
+that validation shape.
 
 The prior row512/q2048 row-tiled logits warm measurements were:
 
@@ -118,38 +139,48 @@ The full benchmark artifact is:
 /home/aidendle94/Documents/workspace/experiment_runs/mqa_logits_rowtile_20260519T070940Z/runs/rowtile_128000/warm_results.json
 /home/aidendle94/Documents/workspace/experiment_runs/rowtiled_logits_baseline_20260519T081248Z/runs/rowtiled_baseline_128000_decode64/warm_results.json
 /home/aidendle94/Documents/workspace/experiment_runs/blocked_tune_q4096_20260519T183400Z/report.md
+/home/aidendle94/Documents/workspace/experiment_runs/logits_m32_gsm8k_20260519T233515Z
+/home/aidendle94/Documents/workspace/experiment_runs/logits_m32_max500001_bench500k_20260520T002558Z/report.md
 ```
 
 ## Build The Baseline Image
 
-Build from the workspace root, not from the vLLM root. The Dockerfile needs the
-sibling `flashinfer-latest` checkout in the same build context.
+Build from the vLLM repo root. The Dockerfile fetches the pinned FlashInfer PR
+source itself, so a GitHub checkout of this vLLM repo is sufficient as the build
+context.
+
+The only external image prerequisite is `BASE_IMAGE`: it should be the
+CUDA 13.2 / NCCL 2.30 / vLLM OpenAI base image used on the GB10 cluster. Push
+that base image to a registry or replace `BASE_IMAGE` with an equivalent image
+before building on a different machine.
 
 ```bash
 set -euo pipefail
 
-export WORKSPACE=/home/aidendle94/Documents/workspace
-export VLLM_ROOT=${WORKSPACE}/vllm
+export VLLM_ROOT=/home/aidendle94/Documents/workspace/vllm
 export BASE_IMAGE=sparkrun-vllm-ds4-gb10:ae353d502-static-mla-dirty-20260518T000139Z-cuda13.2-nccl2.30-vllm-openai-base
 export BASELINE_REF=$(git -C "${VLLM_ROOT}" rev-parse --short HEAD)
-export BASELINE_IMAGE=sparkrun-vllm-ds4-gb10:${BASELINE_REF}-rowtiled-logits-baseline-cuda13.2-nccl2.30-vllm-openai-base
+export BASELINE_IMAGE=sparkrun-vllm-ds4-gb10:${BASELINE_REF}-m32-rowtiled-logits-baseline-cuda13.2-nccl2.30-vllm-openai-base
 
-git -C "${VLLM_ROOT}" merge-base --is-ancestor 5b5b63ded HEAD
-test "$(git -C "${WORKSPACE}/flashinfer-latest" rev-parse HEAD)" = "a52ad3a649ab3716efe738be24e837566117d2b3"
+git -C "${VLLM_ROOT}" diff --check
 
+cd "${VLLM_ROOT}"
 DOCKER_BUILDKIT=1 docker build \
-  --file "${VLLM_ROOT}/Dockerfile.baseline" \
+  --file Dockerfile.baseline \
   --build-arg "BASE_IMAGE=${BASE_IMAGE}" \
   --tag "${BASELINE_IMAGE}" \
-  "${WORKSPACE}"
+  "${VLLM_ROOT}"
 ```
 
 The build-time assertion checks that vLLM can see the FlashInfer B12x W4A16
-entrypoints. The Dockerfile also bakes the persistent compile-cache path,
-row-tiled logits top-k env defaults, row512/q4096 runtime env defaults,
-H8/D32/W4 stream fallback env defaults, and blocked sparse MLA accumulator env
-defaults listed in the recipe below, so future overlay images inherit this
-baseline even when the launch recipe does not restate every knob.
+entrypoints. The Dockerfile pins FlashInfer to PR `3336` at commit
+`a52ad3a649ab3716efe738be24e837566117d2b3`; it does not depend on
+`/home/aidendle94/Documents/workspace/flashinfer-latest`. The Dockerfile also
+bakes the persistent compile-cache path, row-tiled logits top-k env defaults,
+M32 logits tile defaults, row512/q4096 runtime env defaults, H8/D32/W4 stream
+fallback env defaults, and blocked sparse MLA accumulator env defaults listed
+in the recipe below, so future overlay images inherit this baseline even when
+the launch recipe does not restate every knob.
 
 ```python
 from vllm.utils.flashinfer import has_flashinfer_b12x_fused_moe
@@ -165,11 +196,11 @@ only when intentionally testing a descendant image.
 
 ```yaml
 recipe_version: "1"
-name: DeepSeek V4 Flash GB10 row-tiled logits prefill baseline
-description: DeepSeek V4 Flash GB10 baseline with FlashInfer B12x W4A16, static SM12x MQA top-k, row-tiled materialized logits top-k, blocked sparse MLA prefill accumulation, combined prefill opts, MTP=2, and 262k context.
+name: DeepSeek V4 Flash GB10 M32 row-tiled logits prefill baseline
+description: DeepSeek V4 Flash GB10 baseline with FlashInfer B12x W4A16, static SM12x MQA top-k, row-tiled materialized logits top-k, M32 logits tiling, blocked sparse MLA prefill accumulation, combined prefill opts, MTP=2, and 262k default context.
 runtime: vllm-distributed
 model: deepseek-ai/DeepSeek-V4-Flash
-container: sparkrun-vllm-ds4-gb10:<commit>-rowtiled-logits-baseline-cuda13.2-nccl2.30-vllm-openai-base
+container: sparkrun-vllm-ds4-gb10:<commit>-m32-rowtiled-logits-baseline-cuda13.2-nccl2.30-vllm-openai-base
 cluster_only: true
 min_nodes: 2
 max_nodes: 2
@@ -198,6 +229,10 @@ env:
   VLLM_SM12X_MQA_TOPK_TRITON: "1"
   VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED: "1"
   VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE: "512"
+  VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M: "32"
+  VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N: "128"
+  VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D: "64"
+  VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS: "4"
   VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS: "64"
   VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: "512"
   VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS: "8192"
@@ -249,21 +284,25 @@ Launch it:
 
 ```bash
 cd /home/aidendle94/Documents/workspace/vllm-ds4-sm120-harness
-sparkrun run /tmp/deepseek-v4-flash-gb10-rowtiled-logits-baseline.yaml --no-follow
+sparkrun run /tmp/deepseek-v4-flash-gb10-m32-rowtiled-logits-baseline.yaml --no-follow
 ```
+
+For 500k validation, use the same image and recipe but set
+`max_model_len: 500001`. A 500000-token prompt with one generated token needs a
+500001 total context budget.
 
 If reusing an older checked harness recipe, make sure it includes the
 combined-prefill and blocked-accumulator env vars above, uses `MAX_ROWS=512`,
 `QUERY_CHUNK_SIZE=4096`, `PREFILL_BLOCK_C=16`, `PREFILL_BLOCK_HEADS=8`,
 `PREFILL_BLOCK_WARPS=4`, `PREFILL_BLOCK_STAGES=2`, and
-the row-tiled logits and H8/D32/W4 fallback topk512 env vars, and removes any
-`--profiler-config` unless you
-are intentionally taking a profile.
+the row-tiled logits, M32 logits tile, and H8/D32/W4 fallback topk512 env vars,
+and removes any `--profiler-config` unless you are intentionally taking a
+profile.
 The old static-MLA profile recipe is not the clean throughput baseline by
 itself.
 
 ```bash
-rg "LOGITS_ROW|MAX_ROWS|STREAM_K_TILES|TOPK512|QUERY_CHUNK|PREFILL_TOPK_CHUNK|BLOCKED_ACCUM|BLOCK_C|BLOCK_HEADS|profiler-config" sparkrun/*.yaml
+rg "LOGITS_ROW|LOGITS_BLOCK|MAX_ROWS|STREAM_K_TILES|TOPK512|QUERY_CHUNK|PREFILL_TOPK_CHUNK|BLOCKED_ACCUM|BLOCK_C|BLOCK_HEADS|profiler-config" sparkrun/*.yaml
 ```
 
 ## Validation
@@ -294,7 +333,7 @@ Required recipe evidence:
 
 ```bash
 sparkrun export running-recipe <cluster-id> | rg \
-  "BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|PREFILL_BLOCK_WARPS|PREFILL_BLOCK_STAGES|QUERY_CHUNK_SIZE|LOGITS_ROW|MAX_ROWS|TOPK512"
+  "BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|PREFILL_BLOCK_WARPS|PREFILL_BLOCK_STAGES|QUERY_CHUNK_SIZE|LOGITS_ROW|LOGITS_BLOCK|MAX_ROWS|TOPK512"
 ```
 
 Expected recipe evidence:
@@ -309,6 +348,10 @@ VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_STAGES: '2'
 VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: '4096'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED: '1'
 VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE: '512'
+VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M: '32'
+VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N: '128'
+VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D: '64'
+VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS: '4'
 VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS: '512'
 VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H: '8'
 VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D: '32'

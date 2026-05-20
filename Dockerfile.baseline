@@ -1,20 +1,24 @@
 # Baseline image for DeepSeek V4 Flash on GB10 with the local SM12x static MLA
 # path, row-tiled materialized MQA logits top-k, blocked sparse MLA prefill
-# accumulation, combined prefill opts, and FlashInfer B12x W4A16 MoE enabled.
+# accumulation, combined prefill opts, M32 logits tiling, and FlashInfer B12x
+# W4A16 MoE enabled.
 #
-# Build from the workspace root, not from the vLLM repo root, because this
-# Dockerfile copies both ./vllm and the sibling ./flashinfer-latest checkout:
+# Build from the vLLM repo root. The FlashInfer PR source is fetched by pinned
+# commit archive during the build, so this Dockerfile does not need a sibling
+# checkout:
 #
-#   cd /home/aidendle94/Documents/workspace
-#   DOCKER_BUILDKIT=1 docker build -f vllm/Dockerfile.baseline \
+#   cd /home/aidendle94/Documents/workspace/vllm
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.baseline \
 #     --build-arg BASE_IMAGE=<vllm-openai-system-nccl-base-image> \
 #     -t <baseline-image-tag> .
 
 ARG BASE_IMAGE=sparkrun-vllm-ds4-gb10:ae353d502-static-mla-dirty-20260518T000139Z-cuda13.2-nccl2.30-vllm-openai-base
+ARG FLASHINFER_COMMIT=a52ad3a649ab3716efe738be24e837566117d2b3
 FROM ${BASE_IMAGE}
+ARG FLASHINFER_COMMIT
 
-LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 row-tiled logits prefill baseline"
-LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, row-tiled materialized MQA logits top-k, blocked sparse MLA prefill accumulation, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
+LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 M32 row-tiled logits prefill baseline"
+LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, row-tiled materialized MQA logits top-k, M32 logits tiling, blocked sparse MLA prefill accumulation, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
 
 ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     VLLM_CACHE_ROOT=/cache/huggingface/vllm-cache \
@@ -24,6 +28,10 @@ ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     VLLM_SM12X_MQA_TOPK_TRITON=1 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED=1 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE=512 \
+    VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M=32 \
+    VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N=128 \
+    VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D=64 \
+    VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS=4 \
     VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS=64 \
     VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512 \
     VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS=8192 \
@@ -42,29 +50,80 @@ ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_STAGES=2 \
     VLLM_MARLIN_USE_ATOMIC_ADD=1
 
-COPY vllm/vllm/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py
-COPY vllm/vllm/triton_utils/jit_monitor.py /usr/local/lib/python3.12/dist-packages/vllm/triton_utils/jit_monitor.py
-COPY vllm/vllm/config/kernel.py /usr/local/lib/python3.12/dist-packages/vllm/config/kernel.py
-COPY vllm/vllm/utils/flashinfer.py /usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py
-COPY vllm/vllm/model_executor/layers/fused_moe/modular_kernel.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py
-COPY vllm/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
-COPY vllm/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
-COPY vllm/vllm/model_executor/layers/deepseek_v4_attention.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/deepseek_v4_attention.py
-COPY vllm/vllm/model_executor/warmup/kernel_warmup.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py
-COPY vllm/vllm/tool_parsers/deepseekv32_tool_parser.py /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/deepseekv32_tool_parser.py
-COPY vllm/vllm/v1/attention/backends/mla/sparse_mla_env.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py
-COPY vllm/vllm/v1/attention/backends/mla/flashmla_sparse.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
-COPY vllm/vllm/v1/attention/backends/mla/sparse_mla_kernels.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
-COPY vllm/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py
-COPY vllm/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_deep_gemm_fallbacks.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_deep_gemm_fallbacks.py
-COPY vllm/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py
-COPY vllm/vllm/v1/attention/ops/deepseek_v4_ops/fp8_einsum.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fp8_einsum.py
-COPY vllm/vllm/v1/spec_decode/utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/utils.py
+COPY vllm/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py
+COPY vllm/triton_utils/jit_monitor.py /usr/local/lib/python3.12/dist-packages/vllm/triton_utils/jit_monitor.py
+COPY vllm/config/kernel.py /usr/local/lib/python3.12/dist-packages/vllm/config/kernel.py
+COPY vllm/utils/flashinfer.py /usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py
+COPY vllm/model_executor/layers/fused_moe/modular_kernel.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py
+COPY vllm/model_executor/layers/fused_moe/oracle/mxfp4.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
+COPY vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+COPY vllm/model_executor/layers/deepseek_v4_attention.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/deepseek_v4_attention.py
+COPY vllm/model_executor/warmup/kernel_warmup.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py
+COPY vllm/tool_parsers/deepseekv32_tool_parser.py /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/deepseekv32_tool_parser.py
+COPY vllm/v1/attention/backends/mla/sparse_mla_env.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py
+COPY vllm/v1/attention/backends/mla/flashmla_sparse.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
+COPY vllm/v1/attention/backends/mla/sparse_mla_kernels.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
+COPY vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py
+COPY vllm/v1/attention/ops/deepseek_v4_ops/sm12x_deep_gemm_fallbacks.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_deep_gemm_fallbacks.py
+COPY vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py
+COPY vllm/v1/attention/ops/deepseek_v4_ops/fp8_einsum.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fp8_einsum.py
+COPY vllm/v1/spec_decode/utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/utils.py
 
-COPY flashinfer-latest/flashinfer/fused_moe/cute_dsl/blackwell_sm12x /usr/local/lib/python3.12/dist-packages/flashinfer/fused_moe/cute_dsl/blackwell_sm12x
-COPY flashinfer-latest/flashinfer/cute_dsl/utils.py /usr/local/lib/python3.12/dist-packages/flashinfer/cute_dsl/utils.py
-COPY flashinfer-latest/flashinfer/cute_dsl/fp4_common.py /usr/local/lib/python3.12/dist-packages/flashinfer/cute_dsl/fp4_common.py
-COPY flashinfer-latest/flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py /usr/local/lib/python3.12/dist-packages/flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py
+RUN FLASHINFER_COMMIT="${FLASHINFER_COMMIT}" python3 - <<'PY'
+import os
+import shutil
+import tarfile
+import tempfile
+import urllib.request
+from pathlib import Path
+
+commit = os.environ["FLASHINFER_COMMIT"]
+archive_url = (
+    "https://github.com/flashinfer-ai/flashinfer/archive/"
+    f"{commit}.tar.gz"
+)
+site_packages = Path("/usr/local/lib/python3.12/dist-packages")
+source_root = f"flashinfer-{commit}"
+copy_items = (
+    (
+        "flashinfer/fused_moe/cute_dsl/blackwell_sm12x",
+        site_packages / "flashinfer/fused_moe/cute_dsl/blackwell_sm12x",
+    ),
+    (
+        "flashinfer/cute_dsl/utils.py",
+        site_packages / "flashinfer/cute_dsl/utils.py",
+    ),
+    (
+        "flashinfer/cute_dsl/fp4_common.py",
+        site_packages / "flashinfer/cute_dsl/fp4_common.py",
+    ),
+    (
+        "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py",
+        site_packages / "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py",
+    ),
+)
+
+with tempfile.TemporaryDirectory() as tmp:
+    archive_path = Path(tmp) / "flashinfer.tar.gz"
+    extract_dir = Path(tmp) / "src"
+    urllib.request.urlretrieve(archive_url, archive_path)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(extract_dir, filter="data")
+    for rel_source, dest in copy_items:
+        source = extract_dir / source_root / rel_source
+        if not source.exists():
+            raise FileNotFoundError(source)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists():
+            if dest.is_dir():
+                shutil.rmtree(dest)
+            else:
+                dest.unlink()
+        if source.is_dir():
+            shutil.copytree(source, dest)
+        else:
+            shutil.copy2(source, dest)
+PY
 
 RUN python3 -m py_compile \
       /usr/local/lib/python3.12/dist-packages/vllm/envs.py \

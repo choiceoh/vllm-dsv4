@@ -386,6 +386,41 @@ def test_sm120_triton_prefill_mqa_topk_stream_config(
     assert _fp8_mqa_topk_stream_config(2048) == (4, 64, 4)
 
 
+def test_sm120_triton_mqa_logits_config(monkeypatch: pytest.MonkeyPatch):
+    from vllm.v1.attention.ops.deepseek_v4_ops.sm12x_mqa import (
+        _fp8_mqa_logits_config,
+        _fp8_mqa_logits_skip_invalid_n_tiles,
+    )
+
+    for name in (
+        "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M",
+        "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N",
+        "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D",
+        "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS",
+        "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_SKIP_INVALID_N_TILES",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert _fp8_mqa_logits_config() == (16, 128, 64, 4)
+    assert not _fp8_mqa_logits_skip_invalid_n_tiles()
+
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M", "32")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N", "256")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D", "128")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS", "8")
+    monkeypatch.setenv(
+        "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_SKIP_INVALID_N_TILES", "1"
+    )
+    assert _fp8_mqa_logits_config() == (32, 256, 128, 8)
+    assert _fp8_mqa_logits_skip_invalid_n_tiles()
+
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M", "7")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N", "999")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D", "13")
+    monkeypatch.setenv("VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS", "2")
+    assert _fp8_mqa_logits_config() == (16, 128, 64, 4)
+
+
 def test_triton_sparse_mla_prefill_topk_chunk_guard(
     monkeypatch: pytest.MonkeyPatch,
 ):

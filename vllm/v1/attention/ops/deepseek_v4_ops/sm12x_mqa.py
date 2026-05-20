@@ -82,6 +82,36 @@ def _fp8_mqa_topk_stream_config(topk: int) -> tuple[int, int, int]:
     return block_h, block_d, num_warps
 
 
+def _fp8_mqa_logits_config() -> tuple[int, int, int, int]:
+    block_m = _env_int_choice(
+        "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_M",
+        16,
+        (8, 16, 32),
+    )
+    block_n = _env_int_choice(
+        "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_N",
+        128,
+        (64, 128, 256),
+    )
+    block_d = _env_int_choice(
+        "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_BLOCK_D",
+        64,
+        (64, 128),
+    )
+    num_warps = _env_int_choice(
+        "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS",
+        4,
+        (4, 8),
+    )
+    return block_m, block_n, block_d, num_warps
+
+
+def _fp8_mqa_logits_skip_invalid_n_tiles() -> bool:
+    return bool(
+        _env_int("VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_SKIP_INVALID_N_TILES", 0)
+    )
+
+
 def _view_packed_fp8_paged_mqa_kv_cache(
     kv_cache: torch.Tensor,
     head_dim: int,
@@ -152,6 +182,7 @@ def _fp8_mqa_logits_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SKIP_INVALID_N_TILES: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -166,6 +197,23 @@ def _fp8_mqa_logits_kernel(
     seq_mask = (offs_n[None, :] >= seq_start[:, None]) & (
         offs_n[None, :] < seq_end[:, None]
     )
+
+    if SKIP_INVALID_N_TILES:
+        tile_start_n = pid_n * BLOCK_N
+        tile_end_n = tl.minimum(tile_start_n + BLOCK_N, seq_len_kv)
+        row_has_tile = valid_m & (seq_start < tile_end_n) & (
+            seq_end > tile_start_n
+        )
+        if tl.max(tl.where(row_has_tile, 1, 0), axis=0) == 0:
+            store_mask = valid_m[:, None] & valid_n[None, :]
+            tl.store(
+                logits_ptr
+                + offs_m[:, None] * stride_lm
+                + offs_n[None, :] * stride_ln,
+                tl.full((BLOCK_M, BLOCK_N), float("-inf"), dtype=tl.float32),
+                mask=store_mask,
+            )
+            return
 
     logits = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for h in tl.range(0, num_heads):
@@ -222,7 +270,8 @@ def fp8_mqa_logits_triton(
     if num_q == 0 or seq_len_kv == 0:
         return logits
 
-    grid = (triton.cdiv(num_q, 16), triton.cdiv(seq_len_kv, 128))
+    block_m, block_n, block_d, num_warps = _fp8_mqa_logits_config()
+    grid = (triton.cdiv(num_q, block_m), triton.cdiv(seq_len_kv, block_n))
     _fp8_mqa_logits_kernel[grid](
         q,
         k_fp8,
@@ -244,10 +293,11 @@ def fp8_mqa_logits_triton(
         weights.stride(1),
         logits.stride(0),
         logits.stride(1),
-        BLOCK_M=16,
-        BLOCK_N=128,
-        BLOCK_D=64,
-        num_warps=4,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_D=block_d,
+        SKIP_INVALID_N_TILES=_fp8_mqa_logits_skip_invalid_n_tiles(),
+        num_warps=num_warps,
     )
     return logits
 
