@@ -16,7 +16,7 @@ and then layer experiments on top of that image.
 - Model: `deepseek-ai/DeepSeek-V4-Flash`
 - Runtime shape: TP=2, PP=1, EP enabled, MTP=2, fp8 KV
 - Default context shape: `max_model_len=262144`,
-  `max_num_batched_tokens=8192`, `max_num_seqs=1`
+  `max_num_batched_tokens=8192`, `max_num_seqs=8`
 - Extended-context validation shape: `max_model_len=500001` for a
   500000-token prompt plus one output token
 - MoE backend: `FLASHINFER_B12X_MXFP4_BF16`
@@ -42,6 +42,11 @@ and then layer experiments on top of that image.
   `TRITON_CACHE_DIR=/cache/huggingface/triton-cache`,
   `TORCHINDUCTOR_CACHE_DIR=/cache/huggingface/torchinductor-cache`, and
   `TRITON_CACHE_AUTOTUNING=1`
+- Small-batch MoE stream guard:
+  `VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD=0`. This disables only the
+  existing shared-expert auxiliary-stream overlap path that is unstable on
+  tiny GB10 requests; long-context prefill remains on the same sparse MLA and
+  logits kernels.
 - Combined prefill opts:
   `VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512`,
   `VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS=1`,
@@ -51,7 +56,8 @@ and then layer experiments on top of that image.
   `VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS=4`,
   `VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE=4096`, and
   `VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE=1024`
-- Small-context clamp removed:
+- Small-context path: keep the row-tiled logits and sparse prefill chunk path
+  enabled from the first KV token with
   `VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS=1` and
   `VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_MIN_TOKENS=1`
 - Blocked sparse MLA prefill accumulator enabled in the baseline image and
@@ -77,8 +83,10 @@ The current M64 + stability + CUTeDSL warm measurements are:
 | 128k | 1 | 1092.09 | n/a | 0 | 0 / 0 |
 | 128k | 64 | 1120.66 | 35.80 | 0 | 44 / 42 |
 
-The small-context clamp removal was validated on 2026-05-20 with warm
-single-token requests against the same baseline image:
+Earlier small-context clamp-removal tests on 2026-05-20 showed better warm
+single-request prefill, but that setting is not the current production
+baseline because later tiny-request stability testing favored the guarded
+fallback thresholds above:
 
 | context | clamped prefill tok/s | unclamped prefill tok/s | delta |
 | ---: | ---: | ---: | ---: |
@@ -258,7 +266,7 @@ defaults:
   gpu_memory_utilization: 0.85
   max_model_len: 262144
   max_num_batched_tokens: 8192
-  max_num_seqs: 1
+  max_num_seqs: 8
   block_size: 256
   kv_cache_dtype: fp8
   served_model_name: deepseek-v4-flash
@@ -270,6 +278,7 @@ env:
   TRITON_CACHE_AUTOTUNING: "1"
   TORCHINDUCTOR_CACHE_DIR: /cache/huggingface/torchinductor-cache
   VLLM_ENFORCE_STRICT_TOOL_CALLING: "1"
+  VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: "0"
   VLLM_USE_FLASHINFER_MOE_B12X_W4A16: "1"
   VLLM_SM12X_MQA_TOPK_TRITON: "1"
   VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED: "1"
@@ -381,12 +390,13 @@ Required recipe evidence:
 
 ```bash
 sparkrun export running-recipe <cluster-id> | rg \
-  "default-chat-template|MIN_KV_TOKENS|TOPK_CHUNK_MIN|BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|PREFILL_BLOCK_WARPS|PREFILL_BLOCK_STAGES|QUERY_CHUNK_SIZE|LOGITS_ROW|LOGITS_BLOCK|MAX_ROWS|TOPK512"
+  "default-chat-template|SHARED_EXPERTS_STREAM|MIN_KV_TOKENS|TOPK_CHUNK_MIN|BLOCKED_ACCUM|PREFILL_BLOCK_C|PREFILL_BLOCK_HEADS|PREFILL_BLOCK_WARPS|PREFILL_BLOCK_STAGES|QUERY_CHUNK_SIZE|LOGITS_ROW|LOGITS_BLOCK|MAX_ROWS|TOPK512"
 ```
 
 Expected recipe evidence:
 
 ```text
+VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: '0'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM: '1'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE: '1'
 VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_C: '16'

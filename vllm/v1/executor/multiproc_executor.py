@@ -913,6 +913,21 @@ class WorkerProc:
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
 
+    def enqueue_async_output(self, output: Any):
+        """Enqueues async worker output without letting the output thread die.
+
+        AsyncModelRunnerOutput materialization can raise after the worker
+        method has returned. Report that failure through worker_response_mq so
+        the driver sees the real worker error instead of timing out while
+        waiting for a sample_tokens response.
+        """
+        try:
+            self.enqueue_output(output)
+        except Exception as e:
+            logger.exception("WorkerProc async output handling failed.")
+            if (response_mq := self.worker_response_mq) is not None:
+                response_mq.enqueue((WorkerProc.ResponseStatus.FAILURE, str(e)))
+
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,
         it is passed to the async_output_busy_loop thread. Otherwise, it is
@@ -939,7 +954,7 @@ class WorkerProc:
 
         while True:
             output = self.async_output_queue.get()
-            self.enqueue_output(output)
+            self.enqueue_async_output(output)
 
     def worker_busy_loop(self):
         """Main busy loop for Multiprocessing Workers"""

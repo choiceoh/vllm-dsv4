@@ -15,11 +15,12 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.executor.multiproc_executor import MultiprocExecutor
+from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
 from vllm.v1.executor.uniproc_executor import (
     ExecutorWithExternalLauncher,
     UniProcExecutor,
 )
+from vllm.v1.outputs import AsyncModelRunnerOutput
 
 
 class Mock: ...
@@ -41,6 +42,30 @@ def test_supports_async_scheduling_executor_with_external_launcher():
 
 def test_supports_async_scheduling_multiproc_executor():
     assert MultiprocExecutor.supports_async_scheduling() is True
+
+
+class FailingAsyncModelRunnerOutput(AsyncModelRunnerOutput):
+    def get_output(self):
+        raise RuntimeError("async output exploded")
+
+
+class FakeResponseMQ:
+    def __init__(self):
+        self.items: list[Any] = []
+
+    def enqueue(self, item: Any):
+        self.items.append(item)
+
+
+def test_worker_proc_async_output_errors_are_reported():
+    worker_proc = WorkerProc.__new__(WorkerProc)
+    worker_proc.worker_response_mq = FakeResponseMQ()
+
+    worker_proc.enqueue_async_output(FailingAsyncModelRunnerOutput())
+
+    assert worker_proc.worker_response_mq.items == [
+        (WorkerProc.ResponseStatus.FAILURE, "async output exploded")
+    ]
 
 
 class CustomMultiprocExecutor(MultiprocExecutor):

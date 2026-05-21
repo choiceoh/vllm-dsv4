@@ -38,6 +38,19 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() not in ("", "0", "false", "no", "off")
 
 
+def _trace_topk_enabled() -> bool:
+    return _env_bool("VLLM_SPARSE_INDEXER_TRACE", False)
+
+
+def _trace_topk(stage: str, sync: bool = False, **fields) -> None:
+    if not _trace_topk_enabled():
+        return
+    if sync and current_platform.is_cuda():
+        torch.cuda.synchronize()
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.warning("sm12x_mqa_topk_trace stage=%s %s", stage, payload)
+
+
 def _top_k_per_row_prefill_op():
     try:
         from vllm import _custom_ops as _custom_ops  # noqa: F401
@@ -88,6 +101,7 @@ def _triton_prefill_mqa_topk_row_tile_size(
     )
     if (
         row_count < min_rows_for_topk
+        or k_values.shape[0] < topk_tokens
         or k_values.shape[0] < min_kv_tokens
         or topk_tokens not in (512, 2048)
     ):
@@ -328,6 +342,10 @@ def _fp8_mqa_logits_topk_triton(
     if not (q_scale is None and q_values.dim() == 3 and k_values.dim() == 2):
         return False
 
+    topk_tokens = out.shape[1]
+    if topk_tokens not in (512, 2048) or k_values.shape[0] < topk_tokens:
+        return False
+
     logits_bytes = q_values.shape[0] * k_values.shape[0] * torch.float32.itemsize
     if logits_bytes > _SM120_MQA_TRITON_TOPK_MAX_LOGITS_BYTES:
         return False
@@ -337,7 +355,6 @@ def _fp8_mqa_logits_topk_triton(
     )
 
     logits = fp8_mqa_logits_triton(q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke)
-    topk_tokens = out.shape[1]
     select_k = min(topk_tokens, logits.shape[1])
     out.fill_(-1)
     if select_k == 0:
@@ -401,6 +418,8 @@ def _fp8_mqa_logits_topk_triton_row_tiled(
     if kv_tokens == 0 or topk_tokens == 0:
         out.fill_(-1)
         return True
+    if kv_tokens < topk_tokens:
+        return False
 
     configured_tile = _env_int(
         "VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE",
@@ -512,20 +531,43 @@ def fp8_fp4_mqa_topk_indices(
     topk_indices: torch.Tensor,
 ) -> bool:
     """Write SM120 FP8 MQA top-k indices without materializing full logits."""
+    _trace_topk(
+        "entry",
+        q_rows=q[0].shape[0],
+        kv_tokens=kv[0].shape[0],
+        topk=topk_indices.shape[1],
+        q_scale=q[1] is not None,
+    )
     if not (
         current_platform.is_cuda()
         and current_platform.is_device_capability_family(120)
         and q[1] is None
     ):
+        _trace_topk("unsupported")
         return False
-    if _fp8_mqa_logits_topk_triton_row_tiled(
+    _trace_topk(
+        "row_tiled_begin",
+        q_rows=q[0].shape[0],
+        kv_tokens=kv[0].shape[0],
+        topk=topk_indices.shape[1],
+    )
+    used_row_tiled = _fp8_mqa_logits_topk_triton_row_tiled(
         q,
         kv,
         weights,
         cu_seqlen_ks,
         cu_seqlen_ke,
         topk_indices,
-    ):
+    )
+    _trace_topk(
+        "row_tiled_end",
+        sync=True,
+        used=used_row_tiled,
+        q_rows=q[0].shape[0],
+        kv_tokens=kv[0].shape[0],
+        topk=topk_indices.shape[1],
+    )
+    if used_row_tiled:
         return True
 
     tile_size = _triton_prefill_mqa_topk_row_tile_size(q[0], kv[0], topk_indices)
@@ -564,6 +606,14 @@ def fp8_fp4_mqa_topk_indices(
                     dtype=topk_indices.dtype,
                 )
             try:
+                _trace_topk(
+                    "stream_tile_begin",
+                    row_start=row_start,
+                    row_end=row_end,
+                    tile_size=tile_size,
+                    kv_tokens=kv[0].shape[0],
+                    topk=topk_tokens,
+                )
                 used_triton = fp8_mqa_topk_indices_triton(
                     q_tile if q_tile.is_contiguous() else q_tile.contiguous(),
                     kv,
@@ -577,6 +627,14 @@ def fp8_fp4_mqa_topk_indices(
                     if cu_seqlen_ke_tile.is_contiguous()
                     else cu_seqlen_ke_tile.contiguous(),
                     topk_tile,
+                )
+                _trace_topk(
+                    "stream_tile_end",
+                    sync=True,
+                    used=used_triton,
+                    row_start=row_start,
+                    row_end=row_end,
+                    topk=topk_tokens,
                 )
             except Exception as exc:
                 logger.warning_once(
@@ -609,16 +667,37 @@ def fp8_fp4_mqa_topk_indices(
             )
             return True
 
-    if _fp8_mqa_logits_topk_triton(
+    _trace_topk(
+        "materialized_triton_begin",
+        q_rows=q[0].shape[0],
+        kv_tokens=kv[0].shape[0],
+        topk=topk_indices.shape[1],
+    )
+    used_materialized = _fp8_mqa_logits_topk_triton(
         q,
         kv,
         weights,
         cu_seqlen_ks,
         cu_seqlen_ke,
         topk_indices,
-    ):
+    )
+    _trace_topk(
+        "materialized_triton_end",
+        sync=True,
+        used=used_materialized,
+        q_rows=q[0].shape[0],
+        kv_tokens=kv[0].shape[0],
+        topk=topk_indices.shape[1],
+    )
+    if used_materialized:
         return True
 
+    _trace_topk(
+        "torch_topk_begin",
+        q_rows=q[0].shape[0],
+        kv_tokens=kv[0].shape[0],
+        topk=topk_indices.shape[1],
+    )
     _fp8_mqa_logits_topk_torch(
         q,
         kv,
@@ -627,6 +706,13 @@ def fp8_fp4_mqa_topk_indices(
         cu_seqlen_ke,
         topk_indices.shape[1],
         out=topk_indices,
+    )
+    _trace_topk(
+        "torch_topk_end",
+        sync=True,
+        q_rows=q[0].shape[0],
+        kv_tokens=kv[0].shape[0],
+        topk=topk_indices.shape[1],
     )
     return True
 

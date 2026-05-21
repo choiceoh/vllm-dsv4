@@ -15,6 +15,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
+from vllm.v1.outputs import AsyncModelRunnerOutput
 from vllm.v1.request import Request
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -32,6 +33,8 @@ def warmup_kernels(
     The first iteration simulates a prefill with requests of
     2 + num_spec_steps prompt tokens each. The second iteration simulates
     a decode step with all requests generating 1 + num_spec_steps tokens.
+    For generative models, an additional greedy prefill/decode pass warms
+    the temperature=0 fast path used by deterministic requests.
     """
     num_spec_steps = model_runner.num_speculative_steps
     # Use 1 + num_spec_steps + 1 tokens so the prefill batch's per-request
@@ -79,45 +82,28 @@ def warmup_kernels(
         nonlocal next_block_id
         return list(range(next_block_id, next_block_id := next_block_id + num_blocks))
 
-    # Step 1: Prefill all requests with 2 + num_spec_steps prompt tokens each.
-    new_reqs = [
-        NewRequestData.from_request(
-            Request(req_ids[i], prompt_token_ids, sampling_params, pooling_params),
-            block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
-            prefill_token_ids=prompt_token_ids,
-        )
-        for i in range(num_reqs)
-    ]
-
-    prefill_output = SchedulerOutput.make_empty()
-    prefill_output.scheduled_new_reqs = new_reqs
-    prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
-    prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
-    prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
-
-    # Disable KV connector for warmup run.
-    model_runner.kv_connector.set_disabled(True)
-    worker_execute_model(prefill_output)
-
-    if not model_runner.is_pooling_model:
-        # Warm up sampler and perform a decode step for non-pooling models.
-
-        grammar_output = None
-        if model_runner.is_last_pp_rank:
-            # Build a GrammarOutput to exercise the structured output bitmask
-            # kernel during the prefill step.
-            vocab_size = model_runner.model_config.get_vocab_size()
-            bitmask_width = (vocab_size + 31) // 32
-            grammar_bitmask = np.full(
-                (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
+    def _make_prefill_output(
+        req_ids: list[str],
+        sampling_params: SamplingParams | None,
+        pooling_params: PoolingParams | None,
+    ) -> SchedulerOutput:
+        new_reqs = [
+            NewRequestData.from_request(
+                Request(req_ids[i], prompt_token_ids, sampling_params, pooling_params),
+                block_ids=tuple(_alloc_blocks(n) for n in prefill_block_counts),
+                prefill_token_ids=prompt_token_ids,
             )
-            grammar_output = GrammarOutput(
-                structured_output_request_ids=req_ids, grammar_bitmask=grammar_bitmask
-            )
+            for i in range(num_reqs)
+        ]
 
-        worker_sample_tokens(grammar_output)
+        prefill_output = SchedulerOutput.make_empty()
+        prefill_output.scheduled_new_reqs = new_reqs
+        prefill_output.num_scheduled_tokens = {rid: prompt_len for rid in req_ids}
+        prefill_output.total_num_scheduled_tokens = prompt_len * num_reqs
+        prefill_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+        return prefill_output
 
-        # Step 2: Decode all requests with 1 + num_spec_steps tokens each.
+    def _make_decode_output(req_ids: list[str]) -> SchedulerOutput:
         cached_req_data = CachedRequestData.make_empty()
         cached_req_data.req_ids = list(req_ids)
         cached_req_data.num_computed_tokens = [prompt_len] * num_reqs
@@ -141,13 +127,59 @@ def warmup_kernels(
             decode_output.num_scheduled_tokens.values()
         )
         decode_output.num_common_prefix_blocks = [0] * num_kv_cache_groups
+        return decode_output
 
-        worker_execute_model(decode_output)
-        worker_sample_tokens(None)
+    def _finish_requests(req_ids: list[str]) -> None:
+        cleanup_output = SchedulerOutput.make_empty()
+        cleanup_output.finished_req_ids = set(req_ids)
+        worker_execute_model(cleanup_output)
 
-    # Clean up - process finish_req_ids.
-    cleanup_output = SchedulerOutput.make_empty()
-    cleanup_output.finished_req_ids = set(req_ids)
-    worker_execute_model(cleanup_output)
+    def _drain_output(output: Any) -> None:
+        if isinstance(output, AsyncModelRunnerOutput):
+            output.get_output()
+
+    # Disable KV connector for warmup run.
+    model_runner.kv_connector.set_disabled(True)
+    prefill_output = _make_prefill_output(req_ids, sampling_params, pooling_params)
+    worker_execute_model(prefill_output)
+
+    if not model_runner.is_pooling_model:
+        # Warm up sampler and perform a decode step for non-pooling models.
+
+        grammar_output = None
+        if model_runner.is_last_pp_rank:
+            # Build a GrammarOutput to exercise the structured output bitmask
+            # kernel during the prefill step.
+            vocab_size = model_runner.model_config.get_vocab_size()
+            bitmask_width = (vocab_size + 31) // 32
+            grammar_bitmask = np.full(
+                (len(req_ids), bitmask_width), fill_value=-1, dtype=np.int32
+            )
+            grammar_output = GrammarOutput(
+                structured_output_request_ids=req_ids, grammar_bitmask=grammar_bitmask
+            )
+
+        _drain_output(worker_sample_tokens(grammar_output))
+
+        # Step 2: Decode all requests with 1 + num_spec_steps tokens each.
+        worker_execute_model(_make_decode_output(req_ids))
+        _drain_output(worker_sample_tokens(None))
+
+        _finish_requests(req_ids)
+
+        # Reuse the fake cache blocks after the first warmup requests finish.
+        next_block_id = 1
+        greedy_req_ids = [f"_warmup_greedy_{i}_" for i in range(num_reqs)]
+        greedy_sampling_params = SamplingParams(temperature=0.0, max_tokens=2)
+        worker_execute_model(
+            _make_prefill_output(greedy_req_ids, greedy_sampling_params, None)
+        )
+        _drain_output(worker_sample_tokens(None))
+        worker_execute_model(_make_decode_output(greedy_req_ids))
+        _drain_output(worker_sample_tokens(None))
+        _finish_requests(greedy_req_ids)
+    else:
+        _finish_requests(req_ids)
+
     model_runner.kv_connector.set_disabled(False)
     torch.accelerator.synchronize()

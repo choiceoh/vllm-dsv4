@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import os
+
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
@@ -42,6 +44,28 @@ SM120_SHORT_ROW_TOPK_MAX_WIDTH = 12288
 
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
+
+
+def _trace_sparse_indexer_enabled() -> bool:
+    return os.getenv("VLLM_SPARSE_INDEXER_TRACE", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _trace_sparse_indexer(stage: str, sync: bool = False, **fields) -> None:
+    if not _trace_sparse_indexer_enabled():
+        return
+    if (
+        sync
+        and current_platform.is_cuda()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        torch.cuda.synchronize()
+    payload = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.warning("sparse_indexer_trace stage=%s %s", stage, payload)
 
 
 def _should_use_sm120_short_row_topk_decode(
@@ -196,6 +220,17 @@ def sparse_attn_indexer(
     has_decode = attn_metadata_narrowed.num_decodes > 0
     has_prefill = attn_metadata_narrowed.num_prefills > 0
     num_decode_tokens = attn_metadata_narrowed.num_decode_tokens
+    _trace_sparse_indexer(
+        "enter",
+        prefix=k_cache_prefix,
+        tokens=hidden_states.shape[0],
+        has_prefill=has_prefill,
+        has_decode=has_decode,
+        prefill_tokens=attn_metadata_narrowed.num_prefill_tokens,
+        decode_tokens=num_decode_tokens,
+        max_seq_len=attn_metadata_narrowed.max_seq_len,
+        use_fp4_cache=use_fp4_cache,
+    )
 
     # q_scale is required iff the FP4 cache path is enabled; the FP8 path
     # folds the Q scale into `weights` inside fused_indexer_q_rope_quant.
@@ -215,12 +250,23 @@ def sparse_attn_indexer(
         # scale_fmt can be None, but the function expects str
         assert scale_fmt is not None
         assert not use_fp4_cache, "Unfused FP4 Insert is not supported yet"
+        _trace_sparse_indexer(
+            "k_cache_insert_begin",
+            prefix=k_cache_prefix,
+            num_tokens=num_tokens,
+        )
         ops.indexer_k_quant_and_cache(
             k,
             kv_cache,
             slot_mapping,
             quant_block_size,
             scale_fmt,
+        )
+        _trace_sparse_indexer(
+            "k_cache_insert_end",
+            sync=True,
+            prefix=k_cache_prefix,
+            num_tokens=num_tokens,
         )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
@@ -240,17 +286,39 @@ def sparse_attn_indexer(
             values_spec,
             scales_spec,
         )
-        for chunk in prefill_metadata.chunks:
+        for chunk_idx, chunk in enumerate(prefill_metadata.chunks):
             k_quant = k_quant_full[: chunk.total_seq_lens]
             k_scale = k_scale_full[: chunk.total_seq_lens]
 
             if not chunk.skip_kv_gather:
+                _trace_sparse_indexer(
+                    "prefill_gather_presync",
+                    prefix=k_cache_prefix,
+                    chunk=chunk_idx,
+                    total_seq_lens=chunk.total_seq_lens,
+                    num_reqs=chunk.num_reqs,
+                )
+                _trace_sparse_indexer(
+                    "prefill_gather_begin",
+                    sync=True,
+                    prefix=k_cache_prefix,
+                    chunk=chunk_idx,
+                    total_seq_lens=chunk.total_seq_lens,
+                    num_reqs=chunk.num_reqs,
+                )
                 ops.cp_gather_indexer_k_quant_cache(
                     kv_cache,
                     k_quant,
                     k_scale,
                     chunk.block_table,
                     chunk.cu_seq_lens,
+                )
+                _trace_sparse_indexer(
+                    "prefill_gather_end",
+                    sync=True,
+                    prefix=k_cache_prefix,
+                    chunk=chunk_idx,
+                    total_seq_lens=chunk.total_seq_lens,
                 )
 
             q_slice = q_quant[chunk.token_start : chunk.token_end]
@@ -272,6 +340,25 @@ def sparse_attn_indexer(
             topk_indices = topk_indices_buffer[
                 chunk.token_start : chunk.token_end, :topk_tokens
             ]
+            # Small prefill chunks can have fewer compressed candidates than
+            # the configured sparse top-k width. The buffer is prefilled with
+            # -1, so clamp the work width and leave non-existent candidates
+            # invalid instead of asking row-topk kernels for impossible lanes.
+            effective_topk_tokens = min(topk_tokens, chunk.max_seq_len)
+            if effective_topk_tokens <= 0:
+                continue
+            topk_indices = topk_indices[:, :effective_topk_tokens]
+            _trace_sparse_indexer(
+                "prefill_fused_topk_begin",
+                prefix=k_cache_prefix,
+                chunk=chunk_idx,
+                q_rows=q_slice.shape[0],
+                kv_tokens=k_quant.shape[0],
+                configured_topk=topk_tokens,
+                effective_topk=effective_topk_tokens,
+                max_seq_len=chunk.max_seq_len,
+                total_seq_lens=chunk.total_seq_lens,
+            )
             if fp8_fp4_mqa_topk_indices(
                 (q_slice_cast, q_scale_slice),
                 (k_quant_cast, k_scale_cast),
@@ -280,8 +367,29 @@ def sparse_attn_indexer(
                 chunk.cu_seqlen_ke,
                 topk_indices,
             ):
+                _trace_sparse_indexer(
+                    "prefill_fused_topk_end",
+                    sync=True,
+                    prefix=k_cache_prefix,
+                    chunk=chunk_idx,
+                    used=True,
+                )
                 continue
+            _trace_sparse_indexer(
+                "prefill_fused_topk_end",
+                sync=True,
+                prefix=k_cache_prefix,
+                chunk=chunk_idx,
+                used=False,
+            )
 
+            _trace_sparse_indexer(
+                "prefill_logits_begin",
+                prefix=k_cache_prefix,
+                chunk=chunk_idx,
+                q_rows=q_slice.shape[0],
+                kv_tokens=k_quant.shape[0],
+            )
             logits = fp8_fp4_mqa_logits(
                 (q_slice_cast, q_scale_slice),
                 (k_quant_cast, k_scale_cast),
@@ -290,9 +398,23 @@ def sparse_attn_indexer(
                 chunk.cu_seqlen_ke,
                 clean_logits=False,
             )
+            _trace_sparse_indexer(
+                "prefill_logits_end",
+                sync=True,
+                prefix=k_cache_prefix,
+                chunk=chunk_idx,
+                logits_shape=tuple(logits.shape),
+            )
             num_rows = logits.shape[0]
 
             if current_platform.is_xpu():
+                _trace_sparse_indexer(
+                    "prefill_row_topk_xpu_begin",
+                    prefix=k_cache_prefix,
+                    chunk=chunk_idx,
+                    num_rows=num_rows,
+                    topk=effective_topk_tokens,
+                )
                 xpu_ops.top_k_per_row_prefill(  # type: ignore[attr-defined]
                     logits,
                     chunk.cu_seqlen_ks,
@@ -301,9 +423,22 @@ def sparse_attn_indexer(
                     num_rows,
                     logits.stride(0),
                     logits.stride(1),
-                    topk_tokens,
+                    effective_topk_tokens,
+                )
+                _trace_sparse_indexer(
+                    "prefill_row_topk_xpu_end",
+                    sync=True,
+                    prefix=k_cache_prefix,
+                    chunk=chunk_idx,
                 )
             else:
+                _trace_sparse_indexer(
+                    "prefill_row_topk_cuda_begin",
+                    prefix=k_cache_prefix,
+                    chunk=chunk_idx,
+                    num_rows=num_rows,
+                    topk=effective_topk_tokens,
+                )
                 torch.ops._C.top_k_per_row_prefill(
                     logits,
                     chunk.cu_seqlen_ks,
@@ -312,7 +447,13 @@ def sparse_attn_indexer(
                     num_rows,
                     logits.stride(0),
                     logits.stride(1),
-                    topk_tokens,
+                    effective_topk_tokens,
+                )
+                _trace_sparse_indexer(
+                    "prefill_row_topk_cuda_end",
+                    sync=True,
+                    prefix=k_cache_prefix,
+                    chunk=chunk_idx,
                 )
 
     if has_decode:

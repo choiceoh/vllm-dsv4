@@ -204,7 +204,7 @@ def test_decode_topk_logits_width_keeps_topk_kernel_width():
 @pytest.mark.skipif(
     not current_platform.is_device_capability_family(120), reason="SM120 only"
 )
-def test_sm120_mqa_direct_topk_falls_back_to_triton_logits(
+def test_sm120_mqa_direct_topk_uses_torch_for_nonstandard_topk(
     monkeypatch: pytest.MonkeyPatch,
 ):
     torch.manual_seed(11)
@@ -232,29 +232,18 @@ def test_sm120_mqa_direct_topk_falls_back_to_triton_logits(
     )
     out = torch.empty(num_q, topk_tokens, device="cuda", dtype=torch.int32)
 
-    original_triton = sm12x_mqa.fp8_mqa_logits_triton
-    triton_calls = 0
+    def fail_triton(*args, **kwargs):
+        raise AssertionError("nonstandard top-k should not use Triton logits")
 
-    def wrapped_triton(*args, **kwargs):
-        nonlocal triton_calls
-        triton_calls += 1
-        return original_triton(*args, **kwargs)
+    def fail_topk_op(*args, **kwargs):
+        raise AssertionError("nonstandard top-k should not use CUDA row top-k")
 
-    monkeypatch.setattr(sm12x_mqa, "fp8_mqa_logits_triton", wrapped_triton)
-    original_topk_op = sm12x_deep_gemm_fallbacks._top_k_per_row_prefill_op()
-    topk_calls = 0
-
-    if original_topk_op is not None:
-        def wrapped_topk_op(*args, **kwargs):
-            nonlocal topk_calls
-            topk_calls += 1
-            return original_topk_op(*args, **kwargs)
-
-        monkeypatch.setattr(
-            sm12x_deep_gemm_fallbacks,
-            "_top_k_per_row_prefill_op",
-            lambda: wrapped_topk_op,
-        )
+    monkeypatch.setattr(sm12x_mqa, "fp8_mqa_logits_triton", fail_triton)
+    monkeypatch.setattr(
+        sm12x_deep_gemm_fallbacks,
+        "_top_k_per_row_prefill_op",
+        lambda: fail_topk_op,
+    )
 
     assert deep_gemm_utils.fp8_fp4_mqa_topk_indices(
         (q_fp8, None),
@@ -264,9 +253,6 @@ def test_sm120_mqa_direct_topk_falls_back_to_triton_logits(
         cu_seqlen_ke,
         out,
     )
-    assert triton_calls == 1
-    if original_topk_op is not None:
-        assert topk_calls == 1
 
     reference_logits = sm12x_deep_gemm_fallbacks._fp8_mqa_logits_torch(
         (q_fp8, None),

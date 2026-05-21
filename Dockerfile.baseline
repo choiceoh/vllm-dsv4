@@ -25,6 +25,7 @@ ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     TRITON_CACHE_DIR=/cache/huggingface/triton-cache \
     TRITON_CACHE_AUTOTUNING=1 \
     TORCHINDUCTOR_CACHE_DIR=/cache/huggingface/torchinductor-cache \
+    VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD=0 \
     VLLM_SM12X_MQA_TOPK_TRITON=1 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED=1 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE=512 \
@@ -61,9 +62,13 @@ COPY vllm/model_executor/layers/fused_moe/modular_kernel.py /usr/local/lib/pytho
 COPY vllm/model_executor/layers/fused_moe/oracle/mxfp4.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
 COPY vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
 COPY vllm/model_executor/layers/deepseek_v4_attention.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/deepseek_v4_attention.py
+COPY vllm/model_executor/layers/sparse_attn_indexer.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py
 COPY vllm/model_executor/warmup/kernel_warmup.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py
 COPY vllm/tool_parsers/deepseekv32_tool_parser.py /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/deepseekv32_tool_parser.py
 COPY vllm/v1/core/single_type_kv_cache_manager.py /usr/local/lib/python3.12/dist-packages/vllm/v1/core/single_type_kv_cache_manager.py
+COPY vllm/v1/executor/multiproc_executor.py /usr/local/lib/python3.12/dist-packages/vllm/v1/executor/multiproc_executor.py
+COPY vllm/v1/worker/gpu/warmup.py /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/warmup.py
+COPY vllm/v1/attention/backends/mla/indexer.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py
 COPY vllm/v1/attention/backends/mla/sparse_swa.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py
 COPY vllm/v1/attention/backends/mla/sparse_mla_env.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py
 COPY vllm/v1/attention/backends/mla/flashmla_sparse.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
@@ -144,9 +149,13 @@ RUN python3 -m py_compile \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/deepseek_v4_attention.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py \
       /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/deepseekv32_tool_parser.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/core/single_type_kv_cache_manager.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/v1/executor/multiproc_executor.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/warmup.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/indexer.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_swa.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py \
