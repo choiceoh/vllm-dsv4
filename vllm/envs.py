@@ -254,6 +254,7 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
     VLLM_USE_FLASHINFER_MOE_B12X_W4A16: bool = False
+    VLLM_USE_FLASHINFER_MOE_B12X_W4A8: bool = False
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
@@ -1525,6 +1526,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # BF16 (activation) x MXFP4 (weight) MoE backend.
     "VLLM_USE_FLASHINFER_MOE_B12X_W4A16": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_B12X_W4A16", "0"))
+    ),
+    # If set to 1 with VLLM_USE_FLASHINFER_MOE_B12X_W4A16, route the
+    # FlashInfer B12x SM12x backend through W4A8/MXFP8 activations.
+    "VLLM_USE_FLASHINFER_MOE_B12X_W4A8": lambda: bool(
+        int(os.getenv("VLLM_USE_FLASHINFER_MOE_B12X_W4A8", "0"))
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.
