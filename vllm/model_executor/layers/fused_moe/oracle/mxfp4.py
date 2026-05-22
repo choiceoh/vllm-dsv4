@@ -622,6 +622,18 @@ def select_deepseek_v4_mxfp4_moe_backend(
             activation_format,
         )
 
+    if (
+        envs.is_set("VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS")
+        and envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS
+    ):
+        return _return_or_raise(
+            Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+            config,
+            kMxfp4Static,
+            kMxfp8Dynamic,
+            activation_format,
+        )
+
     # DeepSeek-V4 on ROCm is more accurate with the unfused Triton MXFP4 path
     # than the default AITER path. Prefer Triton-unfused for this routing mode,
     # while keeping AITER as a fallback if Triton-unfused rejects the config.
@@ -1308,8 +1320,8 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 ]:
     """Convert loaded weights into backend-specific kernel format.
 
-    Supports DeepGEMM, TRTLLM MXFP8, Triton, Marlin, and FlashInfer B12x
-    backends.
+    Supports DeepGEMM, TRTLLM MXFP8, CUTLASS MXFP8, Triton, Marlin, and
+    FlashInfer B12x backends.
     """
 
     if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
@@ -1408,6 +1420,48 @@ def convert_weight_to_mxfp4_moe_kernel_format(
                 rows=hidden_size,
                 cols=intermediate_size,
             ),
+            w13_bias,
+            w2_bias,
+        )
+
+    if mxfp4_backend == Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8:
+        from flashinfer import block_scale_interleave
+
+        w13_weight = w13_weight.data
+        w2_weight = w2_weight.data
+        w13_weight_scale = w13_weight_scale.data
+        w2_weight_scale = w2_weight_scale.data
+
+        # FlashInfer CUTLASS follows the same SwiGLU source convention as the
+        # B12x path: present [up, gate] while vLLM stores [gate, up].
+        w1_weight = w13_weight[:, :intermediate_size, :]
+        w3_weight = w13_weight[:, intermediate_size:, :]
+        w13_weight = torch.cat([w3_weight, w1_weight], dim=1).contiguous()
+
+        w1_scale = w13_weight_scale[:, :intermediate_size, :]
+        w3_scale = w13_weight_scale[:, intermediate_size:, :]
+        w13_weight_scale = torch.cat([w3_scale, w1_scale], dim=1).contiguous()
+
+        if w13_bias is not None:
+            b1 = w13_bias[:, :intermediate_size]
+            b3 = w13_bias[:, intermediate_size:]
+            w13_bias = torch.cat([b3, b1], dim=1).contiguous()
+
+        w13_scale_shape = w13_weight_scale.shape
+        w13_weight_scale = block_scale_interleave(
+            w13_weight_scale.view(torch.uint8)
+        ).reshape(w13_scale_shape)
+
+        w2_scale_shape = w2_weight_scale.shape
+        w2_weight_scale = block_scale_interleave(
+            w2_weight_scale.view(torch.uint8)
+        ).reshape(w2_scale_shape)
+
+        return (
+            w13_weight,
+            w2_weight.contiguous(),
+            w13_weight_scale,
+            w2_weight_scale,
             w13_bias,
             w2_bias,
         )
@@ -1641,7 +1695,7 @@ def convert_weight_to_mxfp4_moe_kernel_format(
     else:
         raise ValueError(
             f"Unsupported mxfp4_backend for Mxfp4MoEMethod: {mxfp4_backend}. "
-            f"Expected TRTLLM, Triton, or AITER backend."
+            f"Expected TRTLLM, CUTLASS, Triton, or AITER backend."
         )
 
 
