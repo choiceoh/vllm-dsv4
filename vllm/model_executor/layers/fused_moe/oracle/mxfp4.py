@@ -453,9 +453,6 @@ def select_mxfp4_moe_backend(
     if (
         envs.is_set("VLLM_USE_FLASHINFER_MOE_B12X_W4A16")
         and envs.VLLM_USE_FLASHINFER_MOE_B12X_W4A16
-    ) or (
-        envs.is_set("VLLM_USE_FLASHINFER_MOE_B12X_W4A8")
-        and envs.VLLM_USE_FLASHINFER_MOE_B12X_W4A8
     ):
         return _return_or_raise(
             Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16,
@@ -610,9 +607,6 @@ def select_deepseek_v4_mxfp4_moe_backend(
     if (
         envs.is_set("VLLM_USE_FLASHINFER_MOE_B12X_W4A16")
         and envs.VLLM_USE_FLASHINFER_MOE_B12X_W4A16
-    ) or (
-        envs.is_set("VLLM_USE_FLASHINFER_MOE_B12X_W4A8")
-        and envs.VLLM_USE_FLASHINFER_MOE_B12X_W4A8
     ):
         return _return_or_raise(
             Mxfp4MoeBackend.FLASHINFER_B12X_MXFP4_BF16,
@@ -720,49 +714,6 @@ def _swizzle_flashinfer_w4a16_scales(
     return swizzled.reshape(rows_padded, cols_padded)
 
 
-def _swizzle_flashinfer_b12x_e8m0_scales(
-    scales: torch.Tensor,
-    rows: int,
-    cols_blocks: int,
-) -> torch.Tensor:
-    rows_padded = round_up(rows, 128)
-    cols_padded = round_up(cols_blocks, 4)
-    padded = torch.zeros(
-        (rows_padded, cols_padded),
-        dtype=torch.uint8,
-        device=scales.device,
-    )
-    padded[:rows, :cols_blocks] = scales.to(torch.uint8)
-    swizzled = padded.reshape(rows_padded // 128, 4, 32, cols_padded // 4, 4)
-    swizzled = swizzled.permute(0, 3, 2, 1, 4).contiguous()
-    return swizzled.reshape(rows_padded, cols_padded)
-
-
-def _permute_flashinfer_b12x_w4a8_scale_k_blocks(
-    scales: torch.Tensor,
-) -> torch.Tensor:
-    """Put logical MXFP4 scale blocks in the K-slot order read by SM12x W4A8."""
-    cols = scales.shape[-1]
-    groups = cols // 8
-    if groups == 0:
-        return scales.contiguous()
-
-    # For one group of eight logical 32-wide K blocks, the W4A8 MMA consumes
-    # scale slots in logical order [0, 4, 1, 5, 2, 6, 3, 7]. Therefore the
-    # physical storage slots must contain logical blocks [0, 2, 4, 6, 1, 3, 5, 7].
-    perm = torch.tensor(
-        (0, 2, 4, 6, 1, 3, 5, 7),
-        device=scales.device,
-        dtype=torch.long,
-    )
-    prefix_cols = groups * 8
-    prefix = scales[..., :prefix_cols].reshape(*scales.shape[:-1], groups, 8)
-    prefix = prefix.index_select(-1, perm).reshape(*scales.shape[:-1], prefix_cols)
-    if prefix_cols == cols:
-        return prefix.contiguous()
-    return torch.cat((prefix, scales[..., prefix_cols:]), dim=-1).contiguous()
-
-
 def _mxfp4_scales_to_flashinfer_w4a16(
     scales: torch.Tensor,
     *,
@@ -793,40 +744,6 @@ def _mxfp4_scales_to_flashinfer_w4a16(
     swizzled = [
         _swizzle_flashinfer_w4a16_scales(scale_f8[e], rows, cols // 16)
         for e in range(scale_f8.shape[0])
-    ]
-    return torch.stack(swizzled, dim=0).contiguous()
-
-
-def _mxfp4_scales_to_flashinfer_w4a8(
-    scales: torch.Tensor,
-    *,
-    rows: int,
-    cols: int,
-) -> torch.Tensor:
-    if cols % 32 != 0:
-        raise ValueError(f"FlashInfer B12x W4A8 requires cols % 32 == 0, got {cols}")
-
-    scale_cols = scales.shape[-1]
-    if scale_cols == cols // 16:
-        scales = scales[..., ::2]
-    elif scale_cols != cols // 32:
-        raise ValueError(
-            "FlashInfer B12x W4A8 expected MXFP4 scales with either "
-            f"{cols // 32} or {cols // 16} columns, got {scale_cols}."
-        )
-
-    if scales.dtype == torch.uint8:
-        scale_u8 = scales
-    else:
-        scale_f32 = scales.float().clamp_min(torch.finfo(torch.float32).tiny)
-        scale_u8 = torch.clamp(torch.round(torch.log2(scale_f32)) + 127, 0, 255).to(
-            torch.uint8
-        )
-
-    scale_u8 = _permute_flashinfer_b12x_w4a8_scale_k_blocks(scale_u8)
-    swizzled = [
-        _swizzle_flashinfer_b12x_e8m0_scales(scale_u8[e], rows, cols // 32)
-        for e in range(scale_u8.shape[0])
     ]
     return torch.stack(swizzled, dim=0).contiguous()
 
@@ -1398,24 +1315,15 @@ def convert_weight_to_mxfp4_moe_kernel_format(
             b3 = w13_bias[:, intermediate_size:]
             w13_bias = torch.cat([b3, b1], dim=1).contiguous()
 
-        scale_converter = (
-            _mxfp4_scales_to_flashinfer_w4a8
-            if (
-                envs.is_set("VLLM_USE_FLASHINFER_MOE_B12X_W4A8")
-                and envs.VLLM_USE_FLASHINFER_MOE_B12X_W4A8
-            )
-            else _mxfp4_scales_to_flashinfer_w4a16
-        )
-
         return (
             w13_weight,
             w2_weight.contiguous(),
-            scale_converter(
+            _mxfp4_scales_to_flashinfer_w4a16(
                 w13_weight_scale,
                 rows=2 * intermediate_size,
                 cols=hidden_size,
             ),
-            scale_converter(
+            _mxfp4_scales_to_flashinfer_w4a16(
                 w2_weight_scale,
                 rows=hidden_size,
                 cols=intermediate_size,

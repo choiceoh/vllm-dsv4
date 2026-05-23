@@ -3,10 +3,8 @@
 
 import torch
 
-from vllm import envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config
-from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -23,8 +21,6 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.utils import replace_parameter
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_b12x_fused_moe
-
-logger = init_logger(__name__)
 
 
 class FlashInferB12xW4A16Experts(mk.FusedMoEExpertsModular):
@@ -59,14 +55,6 @@ class FlashInferB12xW4A16Experts(mk.FusedMoEExpertsModular):
         self._prepared_weights = None
         self._expert_map_cache_key: tuple[int, torch.device, torch.dtype] | None = None
         self._expert_map_cache: torch.Tensor | None = None
-        self._use_w4a8 = (
-            envs.is_set("VLLM_USE_FLASHINFER_MOE_B12X_W4A8")
-            and envs.VLLM_USE_FLASHINFER_MOE_B12X_W4A8
-        )
-        if self._use_w4a8:
-            logger.info_once(
-                "Using FlashInfer B12x W4A8/MXFP8 MoE path for MXFP4 experts."
-            )
 
     @property
     def expects_unquantized_inputs(self) -> bool:
@@ -171,16 +159,6 @@ class FlashInferB12xW4A16Experts(mk.FusedMoEExpertsModular):
             (self.local_num_experts,), dtype=torch.float32, device=device
         )
 
-        if self._use_w4a8:
-            self._prepared_weights = None
-            logger.info_once(
-                "FlashInfer B12x W4A8 keeps compressed MXFP4 weights resident "
-                "and quantizes activations to MXFP8 inside the MoE dispatch."
-            )
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            return
-
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_w4a16_prepare import (
             prepare_w4a16_packed_weights,
         )
@@ -254,64 +232,29 @@ class FlashInferB12xW4A16Experts(mk.FusedMoEExpertsModular):
         self._expert_map_cache = normalized
         return normalized
 
-    def _map_topk_ids_for_w4a8(
-        self,
-        topk_ids: torch.Tensor,
-        topk_weights: torch.Tensor,
-        expert_map: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, int]:
-        if expert_map is None:
-            return topk_ids, topk_weights, self.global_num_experts
-
-        normalized_expert_map = self._normalize_expert_map(
-            expert_map, topk_ids.device
-        )
-        assert normalized_expert_map is not None
-        safe_ids = topk_ids.clamp(0, self.global_num_experts - 1).to(torch.long)
-        mapped_topk_ids = normalized_expert_map[safe_ids].to(torch.int32)
-        valid = (topk_ids >= 0) & (mapped_topk_ids >= 0)
-        mapped_topk_ids = mapped_topk_ids.clamp_min(0)
-        topk_weights = topk_weights * valid.to(topk_weights.dtype)
-        return mapped_topk_ids, topk_weights, self.local_num_experts
-
     def _get_workspace(
         self,
         hidden_states: torch.Tensor,
         topk_ids: torch.Tensor,
         expert_map: torch.Tensor | None,
-        launch_num_experts: int,
     ):
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
             _get_cached_workspace,
-            select_sm120_moe_backend,
         )
 
         routed_rows = int(topk_ids.size(0)) * int(self.topk)
-        quant_mode = "w4a8" if self._use_w4a8 else "w4a16"
-        backend = (
-            select_sm120_moe_backend(
-                num_tokens=max(1, int(topk_ids.size(0))),
-                num_topk=self.topk,
-                quant_mode=quant_mode,
-            )
-            if self._use_w4a8
-            else "w4a16"
-        )
         workspace = _get_cached_workspace(
-            backend=backend,
+            backend="w4a16",
             state_E=self.local_num_experts,
-            weight_E=launch_num_experts,
+            weight_E=self.global_num_experts,
             routed_rows=max(1, routed_rows),
             k=int(hidden_states.size(1)),
             n=self.intermediate_size_per_partition,
             num_topk=self.topk,
             device=hidden_states.device,
-            quant_mode=quant_mode,
+            quant_mode="w4a16",
             activation="silu",
         )
-        if self._use_w4a8:
-            return workspace
-
         normalized_expert_map = self._normalize_expert_map(
             expert_map, hidden_states.device
         )
@@ -345,16 +288,7 @@ class FlashInferB12xW4A16Experts(mk.FusedMoEExpertsModular):
 
         topk_ids = self._normalize_topk_ids(topk_ids)
         topk_weights = self._normalize_topk_weights(topk_weights)
-        quant_mode = "w4a8" if self._use_w4a8 else "w4a16"
-        prepared_weights = None if self._use_w4a8 else self._prepared_weights
-        launch_num_experts = global_num_experts
-        if self._use_w4a8:
-            topk_ids, topk_weights, launch_num_experts = self._map_topk_ids_for_w4a8(
-                topk_ids, topk_weights, expert_map
-            )
-        workspace = self._get_workspace(
-            hidden_states, topk_ids, expert_map, launch_num_experts
-        )
+        workspace = self._get_workspace(hidden_states, topk_ids, expert_map)
 
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_dispatch import (
             launch_sm120_moe,
@@ -371,13 +305,13 @@ class FlashInferB12xW4A16Experts(mk.FusedMoEExpertsModular):
             w2_weight=w2,
             w2_weight_sf=self.w2_scale,
             w2_alpha=self._w2_alpha,
-            num_experts=launch_num_experts,
+            num_experts=global_num_experts,
             top_k=self.topk,
             num_local_experts=self.local_num_experts,
             scatter_output=output,
             activation="silu",
-            quant_mode=quant_mode,
+            quant_mode="w4a16",
             source_format="compressed_tensors",
             _workspace=workspace,
-            _prepared_weights=prepared_weights,
+            _prepared_weights=self._prepared_weights,
         )

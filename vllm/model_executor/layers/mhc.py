@@ -36,6 +36,35 @@ class MHCPreOp(CustomOp):
         sinkhorn_repeat: int,
         n_splits: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if torch.compiler.is_compiling():
+            return torch.ops.vllm.mhc_pre_tilelang(
+                residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+            )
+
+        from vllm.v1.attention.backends.mla.b12x_integration import b12x_mhc_pre
+
+        b12x_out = b12x_mhc_pre(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_pre_eps,
+            hc_sinkhorn_eps=hc_sinkhorn_eps,
+            hc_post_mult_value=hc_post_mult_value,
+            sinkhorn_repeat=sinkhorn_repeat,
+        )
+        if b12x_out is not None:
+            return b12x_out
         return torch.ops.vllm.mhc_pre_tilelang(
             residual,
             fn,
@@ -114,6 +143,16 @@ class MHCPostOp(CustomOp):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
+        if torch.compiler.is_compiling():
+            return torch.ops.vllm.mhc_post_tilelang(
+                x, residual, post_layer_mix, comb_res_mix
+            )
+
+        from vllm.v1.attention.backends.mla.b12x_integration import b12x_mhc_post
+
+        b12x_out = b12x_mhc_post(x, residual, post_layer_mix, comb_res_mix)
+        if b12x_out is not None:
+            return b12x_out
         return torch.ops.vllm.mhc_post_tilelang(
             x, residual, post_layer_mix, comb_res_mix
         )
@@ -291,6 +330,45 @@ class MHCFusedPostPreOp(CustomOp):
         n_splits: int = 1,
         tile_n: int = 1,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if torch.compiler.is_compiling():
+            return torch.ops.vllm.mhc_fused_post_pre_tilelang(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                n_splits,
+                tile_n,
+            )
+
+        from vllm.v1.attention.backends.mla.b12x_integration import (
+            b12x_mhc_post,
+            b12x_mhc_pre,
+        )
+
+        b12x_residual = b12x_mhc_post(x, residual, post_layer_mix, comb_res_mix)
+        if b12x_residual is not None:
+            b12x_pre = b12x_mhc_pre(
+                b12x_residual,
+                fn,
+                hc_scale,
+                hc_base,
+                rms_eps=rms_eps,
+                hc_pre_eps=hc_pre_eps,
+                hc_sinkhorn_eps=hc_sinkhorn_eps,
+                hc_post_mult_value=hc_post_mult_value,
+                sinkhorn_repeat=sinkhorn_repeat,
+            )
+            if b12x_pre is not None:
+                next_post, next_comb, layer_input = b12x_pre
+                return b12x_residual, next_post, next_comb, layer_input
         return torch.ops.vllm.mhc_fused_post_pre_tilelang(
             x,
             residual,

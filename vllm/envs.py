@@ -174,6 +174,10 @@ if TYPE_CHECKING:
     VLLM_ENABLE_DEEPSEEK_V4_MHC_WARMUP: bool = True
     VLLM_DEEPSEEK_V4_MHC_WARMUP_TOKEN_SIZES: list[int] | None = None
     VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP: bool = True
+    VLLM_USE_B12X_DEEPSEEK_V4: bool = False
+    VLLM_USE_B12X_DEEPSEEK_V4_MHC: bool | None = None
+    VLLM_USE_B12X_DEEPSEEK_V4_INDEXER: bool | None = None
+    VLLM_USE_B12X_DEEPSEEK_V4_COMPRESSED_MLA: bool | None = None
     VLLM_TRITON_MLA_SPARSE: bool | None = None
     VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
     VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE: int = 0
@@ -254,7 +258,6 @@ if TYPE_CHECKING:
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_BF16: bool = False
     VLLM_USE_FLASHINFER_MOE_B12X_W4A16: bool = False
-    VLLM_USE_FLASHINFER_MOE_B12X_W4A8: bool = False
     VLLM_ROCM_FP8_MFMA_PAGE_ATTN: bool = False
     VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS: bool = False
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
@@ -1359,6 +1362,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP": lambda: bool(
         int(os.getenv("VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP", "1"))
     ),
+    # Integration for the external b12x DeepSeek V4 kernels.  The umbrella
+    # flag gates all paths; set per-path knobs to force a specific hook.
+    "VLLM_USE_B12X_DEEPSEEK_V4": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_DEEPSEEK_V4", "0"))
+    ),
+    "VLLM_USE_B12X_DEEPSEEK_V4_MHC": lambda: (
+        None
+        if os.getenv("VLLM_USE_B12X_DEEPSEEK_V4_MHC") is None
+        else bool(int(os.getenv("VLLM_USE_B12X_DEEPSEEK_V4_MHC", "0")))
+    ),
+    "VLLM_USE_B12X_DEEPSEEK_V4_INDEXER": lambda: (
+        None
+        if os.getenv("VLLM_USE_B12X_DEEPSEEK_V4_INDEXER") is None
+        else bool(int(os.getenv("VLLM_USE_B12X_DEEPSEEK_V4_INDEXER", "0")))
+    ),
+    "VLLM_USE_B12X_DEEPSEEK_V4_COMPRESSED_MLA": lambda: (
+        None
+        if os.getenv("VLLM_USE_B12X_DEEPSEEK_V4_COMPRESSED_MLA") is None
+        else bool(int(os.getenv("VLLM_USE_B12X_DEEPSEEK_V4_COMPRESSED_MLA", "0")))
+    ),
     # Experimental sparse MLA fallback controls.
     # ``VLLM_TRITON_MLA_SPARSE`` unset means auto-select where FlashMLA sparse
     # is unavailable; set 0/1 to force-disable/force-enable the fallback.
@@ -1526,11 +1549,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # BF16 (activation) x MXFP4 (weight) MoE backend.
     "VLLM_USE_FLASHINFER_MOE_B12X_W4A16": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_B12X_W4A16", "0"))
-    ),
-    # If set to 1 with VLLM_USE_FLASHINFER_MOE_B12X_W4A16, route the
-    # FlashInfer B12x SM12x backend through W4A8/MXFP8 activations.
-    "VLLM_USE_FLASHINFER_MOE_B12X_W4A8": lambda: bool(
-        int(os.getenv("VLLM_USE_FLASHINFER_MOE_B12X_W4A8", "0"))
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.

@@ -871,6 +871,31 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         swa_lens = swa_metadata.decode_swa_lens[:num_decode_tokens]
         swa_indices = swa_metadata.decode_swa_indices[:num_decode_tokens]
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
+        if (
+            envs.VLLM_USE_B12X_DEEPSEEK_V4
+            and envs.VLLM_USE_B12X_DEEPSEEK_V4_COMPRESSED_MLA is True
+        ):
+            from vllm.v1.attention.backends.mla.b12x_integration import (
+                b12x_compressed_mla_decode,
+            )
+
+            if b12x_compressed_mla_decode(
+                q=q,
+                compressed_k_cache=None,
+                swa_k_cache=swa_k_cache,
+                topk_indices=None,
+                topk_lens=None,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                compressed_page_size=None,
+                swa_page_size=swa_metadata.block_size,
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                num_heads=self.num_heads,
+                output=output,
+            ):
+                return
+
         head_block_size = sparse_mla_decode_head_block_size(num_decode_tokens)
         if not mtp_decode:
             fp8ds_paged_sparse_mla_attention_with_sink_multihead(
@@ -950,6 +975,31 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         max_swa_len = swa_metadata.decode_swa_indices.shape[-1]
         compressed_block_size = attn_metadata.block_size // self.compress_ratio
         compressed_topk = topk_indices.shape[-1]
+        if (
+            envs.VLLM_USE_B12X_DEEPSEEK_V4
+            and envs.VLLM_USE_B12X_DEEPSEEK_V4_COMPRESSED_MLA is True
+        ):
+            from vllm.v1.attention.backends.mla.b12x_integration import (
+                b12x_compressed_mla_decode,
+            )
+
+            if b12x_compressed_mla_decode(
+                q=q,
+                compressed_k_cache=compressed_k_cache,
+                swa_k_cache=swa_k_cache,
+                topk_indices=topk_indices,
+                topk_lens=topk_lens,
+                swa_indices=swa_metadata.decode_swa_indices[:num_decode_tokens],
+                swa_lens=swa_metadata.decode_swa_lens[:num_decode_tokens],
+                compressed_page_size=compressed_block_size,
+                swa_page_size=swa_metadata.block_size,
+                sm_scale=self.scale,
+                attn_sink=self.attn_sink,
+                num_heads=self.num_heads,
+                output=output,
+            ):
+                return
+
         topk_chunk_size = min(
             compressed_topk,
             triton_sparse_mla_topk_chunk_size(),

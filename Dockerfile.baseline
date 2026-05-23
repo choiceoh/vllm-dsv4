@@ -1,31 +1,42 @@
-# Baseline image for DeepSeek V4 Flash on GB10 with the local SM12x static MLA
-# path, row-tiled materialized MQA logits top-k, blocked sparse MLA prefill
-# accumulation, combined prefill opts, M64 logits tiling, CUTeDSL FP8 indexer
-# support, stability warmup fixes, and FlashInfer B12x W4A16 MoE enabled.
+# syntax=docker/dockerfile:1.6
+
+# Baseline image for DeepSeek V4 Flash on two GB10/DGX Spark nodes.
 #
-# Build from the vLLM repo root. The FlashInfer PR source is fetched by pinned
-# commit archive during the build, so this Dockerfile does not need a sibling
-# checkout:
+# This Dockerfile is the repo-local rebuild path for the validated 2026-05-23
+# baseline: 256K context, TP=2, EP enabled, fp8 KV cache, MTP=2, CUTLASS W4A8
+# MoE, and the rs-6 B12x DeepSeek V4 mHC hooks. Build it from the vLLM repo
+# root; no external overlay directory is required.
 #
 #   cd /home/aidendle94/Documents/workspace/vllm
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.baseline \
-#     --build-arg BASE_IMAGE=<vllm-openai-system-nccl-base-image> \
+#     --build-arg BASE_IMAGE=<w4a8-cutlass-vllm-openai-base-image> \
 #     -t <baseline-image-tag> .
 
-ARG BASE_IMAGE=sparkrun-vllm-ds4-gb10:ae353d502-static-mla-dirty-20260518T000139Z-cuda13.2-nccl2.30-vllm-openai-base
-ARG FLASHINFER_COMMIT=a52ad3a649ab3716efe738be24e837566117d2b3
+ARG BASE_IMAGE=sparkrun-vllm-ds4-gb10:w4a8-cutlass-swiglu-config-20260522T114518Z-cuda13.2-nccl2.30-vllm-openai-base
 FROM ${BASE_IMAGE}
-ARG FLASHINFER_COMMIT
 
-LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 M64 row-tiled logits prefill baseline"
-LABEL org.opencontainers.image.description="vLLM static SM12x MLA/MQA, row-tiled materialized MQA logits top-k, M64 logits tiling, blocked sparse MLA prefill accumulation, CUTeDSL FP8 indexer support, stability warmup fixes, combined prefill opts, and FlashInfer B12x W4A16 MoE baseline for two-node GB10 sparkrun."
+ARG BASE_IMAGE
+ARG B12X_COMMIT=afbbf71dc47931988646399587c3af1c9be3ee18
+ARG VLLM_BASELINE_COMMIT=local
 
-ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
+LABEL org.opencontainers.image.title="DeepSeek V4 Flash GB10 rs-6 B12x mHC baseline"
+LABEL org.opencontainers.image.description="Validated 256K GB10 baseline with rs-6 B12x mHC, CUTLASS W4A8 MoE, fp8 MLA KV cache, MTP=2, and high-effort thinking defaults."
+
+ENV TORCH_CUDA_ARCH_LIST=12.1a \
     VLLM_CACHE_ROOT=/cache/huggingface/vllm-cache \
     TRITON_CACHE_DIR=/cache/huggingface/triton-cache \
     TRITON_CACHE_AUTOTUNING=1 \
     TORCHINDUCTOR_CACHE_DIR=/cache/huggingface/torchinductor-cache \
+    FLASHINFER_DISABLE_VERSION_CHECK=1 \
+    VLLM_ENFORCE_STRICT_TOOL_CALLING=1 \
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD=0 \
+    VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    VLLM_ENABLE_DEEPSEEK_V4_SPARSE_MLA_WARMUP=0 \
+    VLLM_USE_B12X_DEEPSEEK_V4=1 \
+    VLLM_USE_B12X_DEEPSEEK_V4_MHC=1 \
+    VLLM_USE_B12X_DEEPSEEK_V4_INDEXER=0 \
+    VLLM_USE_B12X_DEEPSEEK_V4_COMPRESSED_MLA=0 \
+    VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=1 \
     VLLM_SM12X_MQA_TOPK_TRITON=1 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILED=1 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_ROW_TILE=512 \
@@ -35,13 +46,13 @@ ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     VLLM_SM12X_MQA_TOPK_TRITON_LOGITS_NUM_WARPS=4 \
     VLLM_SM12X_MQA_TOPK_TRITON_MIN_ROWS=64 \
     VLLM_SM12X_MQA_TOPK_TRITON_MAX_ROWS=512 \
-    VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS=1 \
+    VLLM_SM12X_MQA_TOPK_TRITON_MIN_KV_TOKENS=8192 \
     VLLM_SM12X_MQA_TOPK_TRITON_STREAM_K_TILES=2 \
     VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_H=8 \
     VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_BLOCK_D=32 \
     VLLM_SM12X_MQA_TOPK_TRITON_TOPK512_NUM_WARPS=4 \
     VLLM_TRITON_MLA_SPARSE=1 \
-    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE=4096 \
+    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE=2048 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_SIZE=1024 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_TOPK_CHUNK_MIN_TOKENS=1 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM=1 \
@@ -50,7 +61,11 @@ ENV VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_HEADS=8 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_WARPS=4 \
     VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCK_STAGES=2 \
-    VLLM_MARLIN_USE_ATOMIC_ADD=1
+    VLLM_SM12X_DIRECT_FP8DS_PREFILL=0 \
+    VLLM_MARLIN_USE_ATOMIC_ADD=1 \
+    VLLM_NCCL_SO_PATH=/usr/lib/aarch64-linux-gnu/libnccl.so.2 \
+    NCCL_IB_DISABLE=0 \
+    NCCL_DEBUG=WARN
 
 COPY vllm/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py
 COPY vllm/triton_utils/jit_monitor.py /usr/local/lib/python3.12/dist-packages/vllm/triton_utils/jit_monitor.py
@@ -61,7 +76,9 @@ COPY vllm/utils/flashinfer.py /usr/local/lib/python3.12/dist-packages/vllm/utils
 COPY vllm/model_executor/layers/fused_moe/modular_kernel.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py
 COPY vllm/model_executor/layers/fused_moe/oracle/mxfp4.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
 COPY vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py
+COPY vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
 COPY vllm/model_executor/layers/deepseek_v4_attention.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/deepseek_v4_attention.py
+COPY vllm/model_executor/layers/mhc.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mhc.py
 COPY vllm/model_executor/layers/sparse_attn_indexer.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py
 COPY vllm/model_executor/warmup/kernel_warmup.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py
 COPY vllm/tool_parsers/deepseekv32_tool_parser.py /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/deepseekv32_tool_parser.py
@@ -73,6 +90,7 @@ COPY vllm/v1/attention/backends/mla/sparse_swa.py /usr/local/lib/python3.12/dist
 COPY vllm/v1/attention/backends/mla/sparse_mla_env.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py
 COPY vllm/v1/attention/backends/mla/flashmla_sparse.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py
 COPY vllm/v1/attention/backends/mla/sparse_mla_kernels.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_kernels.py
+COPY vllm/v1/attention/backends/mla/b12x_integration.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/b12x_integration.py
 COPY vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py
 COPY vllm/v1/attention/ops/deepseek_v4_ops/cutedsl_utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/cutedsl_utils.py
 COPY vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py
@@ -82,7 +100,7 @@ COPY vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py /usr/local/lib/python3.1
 COPY vllm/v1/attention/ops/deepseek_v4_ops/fp8_einsum.py /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fp8_einsum.py
 COPY vllm/v1/spec_decode/utils.py /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/utils.py
 
-RUN FLASHINFER_COMMIT="${FLASHINFER_COMMIT}" python3 - <<'PY'
+RUN B12X_COMMIT="${B12X_COMMIT}" python3 - <<'PY'
 import os
 import shutil
 import tarfile
@@ -90,52 +108,23 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
-commit = os.environ["FLASHINFER_COMMIT"]
-archive_url = (
-    "https://github.com/flashinfer-ai/flashinfer/archive/"
-    f"{commit}.tar.gz"
-)
+commit = os.environ["B12X_COMMIT"]
+archive_url = f"https://github.com/lukealonso/b12x/archive/{commit}.tar.gz"
 site_packages = Path("/usr/local/lib/python3.12/dist-packages")
-source_root = f"flashinfer-{commit}"
-copy_items = (
-    (
-        "flashinfer/fused_moe/cute_dsl/blackwell_sm12x",
-        site_packages / "flashinfer/fused_moe/cute_dsl/blackwell_sm12x",
-    ),
-    (
-        "flashinfer/cute_dsl/utils.py",
-        site_packages / "flashinfer/cute_dsl/utils.py",
-    ),
-    (
-        "flashinfer/cute_dsl/fp4_common.py",
-        site_packages / "flashinfer/cute_dsl/fp4_common.py",
-    ),
-    (
-        "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py",
-        site_packages / "flashinfer/gemm/kernels/dense_blockscaled_gemm_sm120_b12x.py",
-    ),
-)
 
 with tempfile.TemporaryDirectory() as tmp:
-    archive_path = Path(tmp) / "flashinfer.tar.gz"
+    archive_path = Path(tmp) / "b12x.tar.gz"
     extract_dir = Path(tmp) / "src"
     urllib.request.urlretrieve(archive_url, archive_path)
     with tarfile.open(archive_path, "r:gz") as archive:
         archive.extractall(extract_dir, filter="data")
-    for rel_source, dest in copy_items:
-        source = extract_dir / source_root / rel_source
-        if not source.exists():
-            raise FileNotFoundError(source)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if dest.exists():
-            if dest.is_dir():
-                shutil.rmtree(dest)
-            else:
-                dest.unlink()
-        if source.is_dir():
-            shutil.copytree(source, dest)
-        else:
-            shutil.copy2(source, dest)
+    source = extract_dir / f"b12x-{commit}" / "b12x"
+    dest = site_packages / "b12x"
+    if not source.exists():
+        raise FileNotFoundError(source)
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.copytree(source, dest)
 PY
 
 RUN python3 -m py_compile \
@@ -148,7 +137,9 @@ RUN python3 -m py_compile \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/deepseek_v4_attention.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mhc.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/sparse_attn_indexer.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/warmup/kernel_warmup.py \
       /usr/local/lib/python3.12/dist-packages/vllm/tool_parsers/deepseekv32_tool_parser.py \
@@ -160,6 +151,7 @@ RUN python3 -m py_compile \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_env.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/flashmla_sparse.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/sparse_mla_kernels.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/mla/b12x_integration.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/cache_utils.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/cutedsl_utils.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fused_indexer_q.py \
@@ -168,8 +160,31 @@ RUN python3 -m py_compile \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/sm12x_mqa.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/ops/deepseek_v4_ops/fp8_einsum.py \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/utils.py && \
-    VLLM_USE_FLASHINFER_MOE_B12X_W4A16=1 python3 - <<'PY'
-from vllm.utils.flashinfer import has_flashinfer_b12x_fused_moe
+    python3 - <<'PY'
+from vllm import envs
+from vllm.utils.flashinfer import (
+    has_flashinfer_b12x_fused_moe,
+    has_flashinfer_cutlass_fused_moe,
+)
+from vllm.v1.attention.backends.mla import b12x_integration as b12x_ds4
+import b12x.integration as b12x_integration
 
+assert envs.VLLM_USE_B12X_DEEPSEEK_V4
+assert envs.VLLM_USE_B12X_DEEPSEEK_V4_MHC
+assert envs.VLLM_USE_B12X_DEEPSEEK_V4_INDEXER is False
+assert envs.VLLM_USE_B12X_DEEPSEEK_V4_COMPRESSED_MLA is False
+assert envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS
+assert has_flashinfer_cutlass_fused_moe()
 assert has_flashinfer_b12x_fused_moe()
+assert b12x_ds4._b12x_import_error() is None
+assert hasattr(b12x_integration, "compressed_mla_decode_forward")
+assert hasattr(b12x_integration, "paged_mqa_index_decode_supertile_topk_fp8")
+assert hasattr(b12x_integration, "b12x_mhc_pre")
+assert hasattr(b12x_integration, "b12x_mhc_post")
 PY
+
+LABEL ai.vllm.baseline.name="deepseek-v4-flash-gb10-rs6-b12x-mhc-256k" \
+      ai.vllm.baseline.base_image="${BASE_IMAGE}" \
+      ai.vllm.baseline.vllm_commit="${VLLM_BASELINE_COMMIT}" \
+      ai.vllm.baseline.b12x_commit="${B12X_COMMIT}" \
+      ai.vllm.baseline.recipe="deepseek-v4-flash"

@@ -6,6 +6,7 @@ import os
 
 import torch
 
+import vllm.envs as envs
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
@@ -459,6 +460,7 @@ def sparse_attn_indexer(
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode
         assert decode_metadata is not None
+        index_k_cache_pages = kv_cache
         kv_cache = kv_cache_as_quant_view(kv_cache, head_dim, use_fp4_cache)
         decode_lens = decode_metadata.decode_lens
         if decode_metadata.requires_padding:
@@ -523,8 +525,27 @@ def sparse_attn_indexer(
         )
         logits_bytes = num_padded_tokens * logits_width * torch.float32.itemsize
         used_direct_topk = False
+        if (
+            envs.VLLM_USE_B12X_DEEPSEEK_V4
+            and envs.VLLM_USE_B12X_DEEPSEEK_V4_INDEXER is True
+            and not use_fp4_cache
+            and padded_q_scale is None
+        ):
+            from vllm.v1.attention.backends.mla.b12x_integration import (
+                b12x_paged_mqa_topk,
+            )
+
+            used_direct_topk = b12x_paged_mqa_topk(
+                q_fp8=padded_q_quant_decode_tokens,
+                weights=weights[:num_padded_tokens],
+                index_k_cache=index_k_cache_pages,
+                seq_lens=seq_lens,
+                block_table=decode_metadata.block_table,
+                topk_indices=topk_indices,
+                topk=topk_tokens,
+            )
         if logits_bytes > sparse_indexer_max_logits_bytes():
-            used_direct_topk = fp8_fp4_paged_mqa_topk_indices(
+            used_direct_topk = used_direct_topk or fp8_fp4_paged_mqa_topk_indices(
                 (padded_q_quant_cast, padded_q_scale),
                 kv_cache,
                 weights[:num_padded_tokens],
