@@ -4,6 +4,7 @@
 DeepseekV4 MLA Attention Layer
 """
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -1242,8 +1243,8 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             q.shape[0],
             triton_sparse_mla_query_chunk_size(),
         )
-        fast_value_min_tokens = (
-            envs.VLLM_TRITON_MLA_SPARSE_PREFILL_FAST_VALUE_MIN_TOKENS
+        fast_value_min_tokens = int(
+            os.getenv("DS4_SPARSE_MLA_FAST_VALUE_MIN_TOKENS", "0") or "0"
         )
         use_fast_value_accum = (
             fast_value_min_tokens > 0
