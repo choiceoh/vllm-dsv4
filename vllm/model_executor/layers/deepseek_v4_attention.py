@@ -1242,6 +1242,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             q.shape[0],
             triton_sparse_mla_query_chunk_size(),
         )
+        fast_value_min_tokens = (
+            envs.VLLM_TRITON_MLA_SPARSE_PREFILL_FAST_VALUE_MIN_TOKENS
+        )
+        use_fast_value_accum = (
+            fast_value_min_tokens > 0
+            and q.shape[0] >= fast_value_min_tokens
+            and envs.VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE
+        )
         if state_buffers is None:
             (
                 max_score_buffer,
@@ -1255,45 +1263,63 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         else:
             max_score_buffer, denom_buffer, output_buffer = state_buffers
 
-        for token_start in range(0, q.shape[0], query_chunk_size):
-            token_end = min(token_start + query_chunk_size, q.shape[0])
-            q_chunk = q[token_start:token_end]
-            indices_chunk_full = combined_indices[token_start:token_end]
-            lens_chunk = combined_lens[token_start:token_end]
-            num_tokens = token_end - token_start
-            max_score = max_score_buffer[:num_tokens]
-            denom = denom_buffer[:num_tokens]
-            subset_acc = output_buffer[:num_tokens]
-            max_score.fill_(float("-inf"))
-            denom.zero_()
-            subset_acc.zero_()
+        fp32_value_attr = "VLLM_TRITON_MLA_SPARSE_PREFILL_BLOCKED_ACCUM_FP32_VALUE"
+        had_fp32_value_override = fp32_value_attr in envs.__dict__
+        previous_fp32_value = envs.__dict__.get(fp32_value_attr)
+        if use_fast_value_accum:
+            # The portable sparse MLA kernel reads this flag internally.
+            # Shadow it only around long prefill calls so short ToolCall
+            # prompts keep the more accurate FP32 value split.
+            setattr(envs, fp32_value_attr, False)
 
-            for index_start in range(0, combined_indices.shape[-1], topk_chunk_size):
-                index_end = min(
-                    index_start + topk_chunk_size,
-                    combined_indices.shape[-1],
-                )
-                accumulate_indexed_sparse_mla_attention_chunk(
-                    q=q_chunk,
-                    kv_flat=kv_flat,
-                    indices=indices_chunk_full[:, index_start:index_end],
-                    lens=lens_chunk,
-                    candidate_offset=index_start,
-                    scale=self.scale,
-                    max_score=max_score,
-                    denom=denom,
-                    acc=subset_acc,
-                )
+        try:
+            for token_start in range(0, q.shape[0], query_chunk_size):
+                token_end = min(token_start + query_chunk_size, q.shape[0])
+                q_chunk = q[token_start:token_end]
+                indices_chunk_full = combined_indices[token_start:token_end]
+                lens_chunk = combined_lens[token_start:token_end]
+                num_tokens = token_end - token_start
+                max_score = max_score_buffer[:num_tokens]
+                denom = denom_buffer[:num_tokens]
+                subset_acc = output_buffer[:num_tokens]
+                max_score.fill_(float("-inf"))
+                denom.zero_()
+                subset_acc.zero_()
 
-            finish_sparse_mla_attention_with_sink(
-                max_score,
-                denom,
-                subset_acc,
-                self.attn_sink,
-                output=output[token_start:token_end],
-            )
-            if output.shape[1] > self.num_heads:
-                output[token_start:token_end, self.num_heads :].zero_()
+                for index_start in range(
+                    0, combined_indices.shape[-1], topk_chunk_size
+                ):
+                    index_end = min(
+                        index_start + topk_chunk_size,
+                        combined_indices.shape[-1],
+                    )
+                    accumulate_indexed_sparse_mla_attention_chunk(
+                        q=q_chunk,
+                        kv_flat=kv_flat,
+                        indices=indices_chunk_full[:, index_start:index_end],
+                        lens=lens_chunk,
+                        candidate_offset=index_start,
+                        scale=self.scale,
+                        max_score=max_score,
+                        denom=denom,
+                        acc=subset_acc,
+                    )
+
+                finish_sparse_mla_attention_with_sink(
+                    max_score,
+                    denom,
+                    subset_acc,
+                    self.attn_sink,
+                    output=output[token_start:token_end],
+                )
+                if output.shape[1] > self.num_heads:
+                    output[token_start:token_end, self.num_heads :].zero_()
+        finally:
+            if use_fast_value_accum:
+                if had_fp32_value_override:
+                    setattr(envs, fp32_value_attr, previous_fp32_value)
+                else:
+                    envs.__dict__.pop(fp32_value_attr, None)
 
     def forward(
         self,
