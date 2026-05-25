@@ -71,6 +71,7 @@ COPY vllm/envs.py /usr/local/lib/python3.12/dist-packages/vllm/envs.py
 COPY vllm/triton_utils/jit_monitor.py /usr/local/lib/python3.12/dist-packages/vllm/triton_utils/jit_monitor.py
 COPY vllm/config/compilation.py /usr/local/lib/python3.12/dist-packages/vllm/config/compilation.py
 COPY vllm/config/kernel.py /usr/local/lib/python3.12/dist-packages/vllm/config/kernel.py
+COPY vllm/engine/arg_utils.py /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py
 COPY vllm/utils/import_utils.py /usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py
 COPY vllm/utils/flashinfer.py /usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py
 COPY vllm/model_executor/layers/fused_moe/modular_kernel.py /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py
@@ -132,6 +133,7 @@ RUN python3 -m py_compile \
       /usr/local/lib/python3.12/dist-packages/vllm/triton_utils/jit_monitor.py \
       /usr/local/lib/python3.12/dist-packages/vllm/config/compilation.py \
       /usr/local/lib/python3.12/dist-packages/vllm/config/kernel.py \
+      /usr/local/lib/python3.12/dist-packages/vllm/engine/arg_utils.py \
       /usr/local/lib/python3.12/dist-packages/vllm/utils/import_utils.py \
       /usr/local/lib/python3.12/dist-packages/vllm/utils/flashinfer.py \
       /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/modular_kernel.py \
@@ -162,8 +164,8 @@ RUN python3 -m py_compile \
       /usr/local/lib/python3.12/dist-packages/vllm/v1/spec_decode/utils.py && \
     python3 - <<'PY'
 from vllm import envs
+from vllm.engine.arg_utils import EngineArgs
 from vllm.utils.flashinfer import (
-    has_flashinfer_b12x_fused_moe,
     has_flashinfer_cutlass_fused_moe,
 )
 from vllm.v1.attention.backends.mla import b12x_integration as b12x_ds4
@@ -174,8 +176,8 @@ assert envs.VLLM_USE_B12X_DEEPSEEK_V4_MHC
 assert envs.VLLM_USE_B12X_DEEPSEEK_V4_INDEXER is False
 assert envs.VLLM_USE_B12X_DEEPSEEK_V4_COMPRESSED_MLA is False
 assert envs.VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS
+assert EngineArgs is not None
 assert has_flashinfer_cutlass_fused_moe()
-assert has_flashinfer_b12x_fused_moe()
 assert b12x_ds4._b12x_import_error() is None
 assert hasattr(b12x_integration, "compressed_mla_decode_forward")
 assert hasattr(b12x_integration, "paged_mqa_index_decode_supertile_topk_fp8")

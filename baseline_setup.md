@@ -153,6 +153,99 @@ command: |
     --load-format safetensors
 ```
 
+## 32K C=1 Perf Recovery Note
+
+The old best 32K C=1 prefill numbers were produced with the 128K fast launch
+shape, not the 256K promotion recipe above. When validating or recovering that
+specific baseline, use:
+
+```text
+max_model_len=131072
+max_num_batched_tokens=8192
+max_num_seqs=6
+load_format=auto
+```
+
+Do not force DeepGEMM for this baseline. The log line
+`Detected quantization_config.scale_fmt=ue8m0; enabling UE8M0 for DeepGEMM.`
+is only a config detection message. The selected baseline route should be:
+
+```text
+Selected TritonFp8BlockScaledMMKernel for Fp8LinearMethod
+Using 'FLASHINFER_CUTLASS_MXFP4_MXFP8' Mxfp4 MoE backend
+Using MoEPrepareAndFinalizeNoDPEPModular
+Using B12x rs-6 mHC pre path.
+Using B12x rs-6 mHC post path.
+```
+
+The recovery recipe used on 2026-05-25 was:
+
+```bash
+sparkrun run \
+  /home/aidendle94/Documents/workspace/autoresearch-results/verify/deepseek-v4-flash-gb10-rs6-b12x-mhc-fastpath-128k-oldbaseline-ae353.yaml
+```
+
+That recipe uses:
+
+```text
+container=sparkrun-vllm-ds4-gb10:rs6-b12x-mhc-fastpath-oldbaseline-ae353-b12x7580-compat4-20260525
+VLLM_USE_DEEP_GEMM=0
+VLLM_MOE_USE_DEEP_GEMM=0
+VLLM_USE_FLASHINFER_MOE_MXFP4_MXFP8_CUTLASS=1
+VLLM_USE_FLASHINFER_MOE_B12X_W4A16=0
+VLLM_USE_B12X_DEEPSEEK_V4=1
+VLLM_USE_B12X_DEEPSEEK_V4_MHC=1
+VLLM_USE_B12X_DEEPSEEK_V4_INDEXER=0
+VLLM_USE_B12X_DEEPSEEK_V4_COMPRESSED_MLA=0
+```
+
+Health and route checks:
+
+```bash
+curl -fsS --max-time 10 http://192.168.50.29:8000/health
+sparkrun status
+ssh 192.168.50.29 '
+container=$(docker ps --format "{{.Names}}" | grep "sparkrun_.*_node_0" | head -n 1)
+docker exec "$container" sh -lc '"'"'
+grep -n "Selected .*Fp8\|Mxfp4 MoE\|MoEPrepare\|Using B12x\|Application startup complete" /tmp/sparkrun_serve.log | tail -n 120
+'"'"'
+'
+ssh 192.168.50.29 '
+container=$(docker ps --format "{{.Names}}" | grep "sparkrun_.*_node_0" | head -n 1)
+docker exec "$container" sh -lc '"'"'
+pid=$(pgrep -f "vllm serve" | head -n 1)
+tr "\0" "\n" < "/proc/${pid}/environ" | grep -E "VLLM_(USE|MOE_USE)_DEEP_GEMM|VLLM_USE_FLASHINFER_MOE|VLLM_USE_B12X|VLLM_SM12X_MQA|VLLM_TRITON_MLA" | sort
+'"'"'
+'
+```
+
+Run the 32K C=1 warm completion benchmark:
+
+```bash
+OUT_DIR=/home/aidendle94/Documents/workspace/autoresearch-results/verify/oldbaseline_ae353_compat4_128kfast_32k_c1_$(date -u +%Y%m%dT%H%M%SZ) \
+  python3 /home/aidendle94/Documents/workspace/experiment_runs/rs6_b12x_mqa_livewidth_20260522T202802Z/run_32k_benchmark_mhc_only.py
+```
+
+Expected recovered performance:
+
+```text
+warmup_32k_max64: about 1447 prefill tok/s
+measured_32k_max64: about 1586 prefill tok/s
+measured2_32k_max64: about 1585 prefill tok/s
+```
+
+Historical best samples for comparison:
+
+```text
+perf32k_20260522T2100Z_mhc_only: 1611-1617 prefill tok/s
+perf32k_20260522T2128Z_mhc_fastpath: 1615-1654 prefill tok/s
+```
+
+If the recovered 32K C=1 run lands around 1300 tok/s, first check whether the
+service was launched with `max_model_len=262144`. That 256K launch shape is
+expected to underperform this 32K comparison. Relaunch the 128K fast recipe
+before investigating kernels.
+
 ## Validation
 
 Health checks:

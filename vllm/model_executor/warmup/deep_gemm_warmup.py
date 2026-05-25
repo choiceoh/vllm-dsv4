@@ -142,6 +142,8 @@ def _fp8_linear_may_use_deep_gemm(module: torch.nn.Module) -> bool:
         and not getattr(module.quant_method, "use_marlin", True)
     ):
         return False
+    if getattr(module, "is_bmm", False):
+        return False
 
     w, _, block_sizes = _extract_data_from_linear_base_module(module)
     return (

@@ -83,6 +83,9 @@ class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
     def process_weights_after_loading(self, layer):
         super().process_weights_after_loading(layer)
+        if getattr(layer, "is_bmm", False):
+            return
+
         params = self._get_layer_params(layer)
         assert layer.weight_block_size is not None
 
