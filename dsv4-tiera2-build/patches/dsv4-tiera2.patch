@@ -1,0 +1,797 @@
+--- a/vllm/model_executor/models/deepseek_mtp.py
++++ b/vllm/model_executor/models/deepseek_mtp.py
+@@ -115,7 +115,9 @@
+         )
+ 
+         hidden_states, residual = self.mtp_block(
+-            positions=positions, hidden_states=hidden_states, residual=None
++            positions=positions,
++            hidden_states=hidden_states,
++            residual=None,
+         )
+         hidden_states = residual + hidden_states
+         return hidden_states
+@@ -147,6 +149,22 @@
+         )
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+ 
++    def set_skip_topk(self, skip: bool):
++        """Toggle skip_topk on all MTP layers with sparse attention.
++
++        Called by the proposer to implement index_share_for_mtp_iteration:
++        step 0 sets skip=False (compute own indices), steps 1+ set skip=True
++        (reuse step 0's indices).
++        """
++        for layer in self.layers.values():
++            mtp_block = getattr(layer, "mtp_block", None)
++            if mtp_block is not None:
++                self_attn = getattr(mtp_block, "self_attn", None)
++                if self_attn is not None:
++                    mla_attn = getattr(self_attn, "mla_attn", None)
++                    if mla_attn is not None and hasattr(mla_attn, "skip_topk"):
++                        mla_attn.skip_topk = skip
++
+     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+         return self.embed_tokens(input_ids)
+ 
+@@ -225,7 +243,11 @@
+         spec_step_idx: int = 0,
+     ) -> torch.Tensor:
+         hidden_states = self.model(
+-            input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
++            input_ids,
++            positions,
++            hidden_states,
++            inputs_embeds,
++            spec_step_idx,
+         )
+         return hidden_states
+ 
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -1004,19 +1004,20 @@
+                 f"{prefix}.indexer",
+             )
+ 
+-            # Enable IndexCache for DeepSeek models to reduce redundant top-k
+-            # token selection computations in sparse attention.
+-            use_index_cache = getattr(config, "use_index_cache", False)
+-            if use_index_cache:
+-                # IndexCache config
+-                # Refer: https://arxiv.org/abs/2603.12201 for more details.
+-                _index_topk_freq = getattr(config, "index_topk_freq", 1)
+-                _index_topk_pattern = getattr(config, "index_topk_pattern", None)
+-                layer_id = extract_layer_index(prefix)
+-                if _index_topk_pattern is None:
+-                    _skip_topk = max(layer_id - 1, 0) % _index_topk_freq != 0
+-                elif 0 <= layer_id < len(_index_topk_pattern):
+-                    _skip_topk = _index_topk_pattern[layer_id] == "S"
++            # IndexCache config
++            # Refer: https://arxiv.org/abs/2603.12201 for more details.
++            _index_topk_freq = getattr(config, "index_topk_freq", 1)
++            _index_topk_pattern = getattr(config, "index_topk_pattern", None)
++            _index_skip_topk_offset = getattr(config, "index_skip_topk_offset", 2)
++            layer_id = extract_layer_index(prefix)
++
++            if _index_topk_pattern is None:
++                _skip_topk = (
++                    max(layer_id - _index_skip_topk_offset + 1, 0) % _index_topk_freq
++                    != 0
++                )
++            elif 0 <= layer_id < len(_index_topk_pattern):
++                _skip_topk = _index_topk_pattern[layer_id] == "S"
+ 
+         else:
+             self.indexer_rope_emb = None
+@@ -1238,8 +1239,8 @@
+         self.start_layer, self.end_layer, self.layers = make_layers(
+             config.num_hidden_layers,
+             lambda prefix: DeepseekV2DecoderLayer(
+-                vllm_config,
+-                prefix,
++                vllm_config=vllm_config,
++                prefix=prefix,
+                 topk_indices_buffer=topk_indices_buffer,
+             ),
+             prefix=f"{prefix}.layers",
+--- a/vllm/transformers_utils/model_arch_config_convertor.py
++++ b/vllm/transformers_utils/model_arch_config_convertor.py
+@@ -50,7 +50,7 @@
+             # special case for deepseek_v4
+             if hasattr(self.hf_text_config, "compress_ratios"):
+                 return self.hf_text_config.head_dim
+-            qk_rope_head_dim = getattr(self.hf_text_config, "qk_rope_head_dim", 0)
++            qk_rope_head_dim = self._get_qk_rope_head_dim()
+             if not envs.VLLM_MLA_DISABLE:
+                 return self.hf_text_config.kv_lora_rank + qk_rope_head_dim
+             else:
+@@ -71,6 +71,38 @@
+         # FIXME(woosuk): This may not be true for all models.
+         return self.get_hidden_size() // total_num_attention_heads
+ 
++    def _get_qk_rope_head_dim(self) -> int:
++        """Get qk_rope_head_dim, fixing the transformers v5.4+ attribute_map bug."""
++        cfg = self.hf_text_config
++        qk_rope_head_dim = getattr(cfg, "qk_rope_head_dim", 0)
++        qk_nope_head_dim = getattr(cfg, "qk_nope_head_dim", 0)
++
++        # In valid MLA configs, qk_rope_head_dim != qk_nope_head_dim.
++        if qk_rope_head_dim == 0 or qk_rope_head_dim != qk_nope_head_dim:
++            return qk_rope_head_dim  # not corrupted
++
++        # Read the correct value from raw config.json.
++        from vllm.transformers_utils.repo_utils import get_hf_file_to_dict
++
++        model_path = self.hf_config.name_or_path
++        if not model_path:
++            return qk_rope_head_dim
++        raw = get_hf_file_to_dict("config.json", model_path)
++        if raw and "qk_rope_head_dim" in raw:
++            correct = raw["qk_rope_head_dim"]
++            if correct != qk_rope_head_dim:
++                logger.info(
++                    "Fixing qk_rope_head_dim: %d -> %d "
++                    "(transformers v5.4+ attribute_map bug)",
++                    qk_rope_head_dim,
++                    correct,
++                )
++                # Patch the config so downstream model layers also get
++                # the correct value.
++                cfg.qk_rope_head_dim = correct
++                return correct
++        return qk_rope_head_dim
++
+     def get_total_num_kv_heads(self) -> int:
+         attributes = [
+             # For Falcon:
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -382,12 +382,15 @@
+             # The block doesn't have hash, eviction is not needed
+             return False
+ 
+-        if self.cached_block_hash_to_block.pop(block_hash, block.block_id) is None:
+-            # block not found in cached_block_hash_to_block,
+-            # eviction is not needed
+-            return False
+-
++        popped = self.cached_block_hash_to_block.pop(block_hash, block.block_id)
++        # issue #2289: reset the block hash whenever it has one, even if the
++        # hash was already absent from the map (stale). A reused block that
++        # keeps a stale _block_hash leaks pool usage and collapses the
++        # prefix-cache hit rate. (reset_hash previously ran past this guard.)
+         block.reset_hash()
++        if popped is None:
++            # block not found in cached_block_hash_to_block, eviction not needed
++            return False
+ 
+         if self.enable_kv_cache_events:
+             self.kv_event_queue.append(
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -218,6 +218,11 @@
+                 self.num_lookahead_tokens = self.num_spec_tokens
+             if speculative_config.uses_draft_model():
+                 self.num_lookahead_tokens = self.num_spec_tokens
++            if speculative_config.use_dflash():
++                # DFlash requires an extra lookahead slot since it uses in-fill-style
++                # decoding instead of standard next-token sampling, so it has a query
++                # for the last sampled token plus queries for each draft token.
++                self.num_lookahead_tokens = self.num_spec_tokens + 1
+ 
+         # Create the KV cache manager.
+         if hash_block_size is None:
+@@ -702,8 +707,9 @@
+                 # extra block gets allocated which
+                 # creates a mismatch between the number
+                 # of local and remote blocks.
++                limit_lookahead_tokens = load_kv_async and self.use_eagle
+                 effective_lookahead_tokens = (
+-                    0 if request.num_computed_tokens == 0 else self.num_lookahead_tokens
++                    0 if limit_lookahead_tokens else self.num_lookahead_tokens
+                 )
+ 
+                 # Determine if we need to allocate cross-attention blocks.
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -242,7 +242,11 @@
+                 cdiv(num_total_computed_tokens, self.block_size) - len(req_blocks)
+             )
+             req_blocks.extend(allocated_blocks)
+-            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
++            if type(self.kv_cache_spec) in (
++                FullAttentionSpec,
++                TQFullAttentionSpec,
++                MLAAttentionSpec,
++            ):
+                 self.new_block_ids.extend(b.block_id for b in allocated_blocks)
+ 
+     def allocate_new_blocks(
+@@ -270,7 +274,11 @@
+         else:
+             new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
+             req_blocks.extend(new_blocks)
+-            if type(self.kv_cache_spec) in (FullAttentionSpec, TQFullAttentionSpec):
++            if type(self.kv_cache_spec) in (
++                FullAttentionSpec,
++                TQFullAttentionSpec,
++                MLAAttentionSpec,
++            ):
+                 self.new_block_ids.extend(b.block_id for b in new_blocks)
+             return new_blocks
+ 
+@@ -864,10 +872,14 @@
+             return
+ 
+         aligned_num_hit_blocks = aligned_cache_hit_length // self.block_size
+-        last_full_prompt_block = max_cache_hit_length // self.block_size
+         contiguous_blocks = cdiv(self.sliding_window - 1, self.block_size)
+         first_protected_block = max(0, aligned_num_hit_blocks - contiguous_blocks)
+-        last_protected_block = max(aligned_num_hit_blocks, last_full_prompt_block)
++        # issue #2289 ②: do NOT protect the transient tail past the stable
++        # aligned cache-hit prefix. eagle/MTP recomputes the last matched
++        # block every request as a fresh physical block, so pinning the tail
++        # pins a new block_id each request (dedup can't catch it) -> a +~1.5
++        # block/req leak with no reuse benefit (the tail is recomputed anyway).
++        last_protected_block = aligned_num_hit_blocks
+         blocks = self.req_to_blocks[request.request_id]
+         protected_blocks = blocks[
+             first_protected_block : min(last_protected_block, len(blocks))
+--- a/vllm/v1/spec_decode/dflash.py
++++ b/vllm/v1/spec_decode/dflash.py
+@@ -68,6 +68,8 @@
+         # For DFlash we use the input embeddings to embed the mask token
+         self.parallel_drafting_hidden_state_tensor = None
+ 
++        self.dflash_causal = self.dflash_config.get("causal", False)
++
+     @override
+     def _create_draft_vllm_config(self) -> VllmConfig:
+         base = super()._create_draft_vllm_config()
+@@ -75,7 +77,7 @@
+             base,
+             attention_config=replace(
+                 base.attention_config,
+-                use_non_causal=True,
++                use_non_causal=not self.dflash_causal,
+             ),
+         )
+ 
+@@ -184,7 +186,7 @@
+             max_seq_len=cad.max_seq_len + num_query_per_req,
+             block_table_tensor=cad.block_table_tensor,
+             slot_mapping=query_slot_mapping,
+-            causal=False,  # Non-causal attention is required for DFlash
++            causal=self.dflash_causal,
+         )
+ 
+         return num_query_total, token_indices_to_sample, new_cad
+@@ -281,20 +283,20 @@
+         per_group, per_layer = super().build_per_group_and_layer_attn_metadata(
+             cad, draft_index
+         )
+-        for layer_name, attn_metadata in per_layer.items():
+-            assert getattr(attn_metadata, "causal", None) is False, (
+-                f"Attention metadata for layer {layer_name} does not have"
+-                " non-causal support, which is required for DFlash."
+-                " Consider using a different attention backend, such as FlashAttention."
+-            )
++        if not self.dflash_causal:
++            # Require all layers to support non-causal attention when required by DFlash
++            for layer_name, attn_metadata in per_layer.items():
++                assert getattr(attn_metadata, "causal", None) is False, (
++                    f"Attention metadata for layer {layer_name} does not have"
++                    " non-causal support, which is required for DFlash."
++                    " Consider using a different attention backend, e.g FlashAttention."
++                )
+         return per_group, per_layer
+ 
+     @override
+     def _get_eagle3_use_aux_hidden_state_from_config(self):
+-        use_aux_hidden_state = True
+-        dflash_config = getattr(
+-            self.draft_model_config.hf_config, "dflash_config", None
+-        )
+-        if dflash_config is not None:
+-            use_aux_hidden_state = dflash_config.get("use_aux_hidden_state", True)
+-        return use_aux_hidden_state
++        return self.dflash_config.get("use_aux_hidden_state", True)
++
++    @property
++    def dflash_config(self):
++        return getattr(self.draft_model_config.hf_config, "dflash_config", None) or {}
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -66,6 +66,7 @@
+         self.draft_model_config = self.speculative_config.draft_model_config
+         self.method = self.speculative_config.method
+         self.pass_hidden_states_to_model = pass_hidden_states_to_model
++        self._share_mtp_indices = False
+ 
+         self.device = device
+         self.dtype = vllm_config.model_config.dtype
+@@ -483,6 +484,11 @@
+         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
+             num_tokens, num_input_tokens, mm_embed_inputs
+         )
++        # Step 0 of index_share_for_mtp_iteration: let the MTP layer
++        # compute its own indices (skip_topk=False) so subsequent steps
++        # can reuse them.
++        if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
++            self.model.model.set_skip_topk(False)
+ 
+         with set_forward_context(
+             per_layer_attn_metadata,
+@@ -501,6 +507,11 @@
+             else:
+                 last_hidden_states, hidden_states = ret_hidden_states
+ 
++        # After step 0: switch to reuse mode so steps 1+ skip the indexer
++        # and read the indices that step 0 just wrote into the shared buffer.
++        if self._share_mtp_indices and hasattr(self.model.model, "set_skip_topk"):
++            self.model.model.set_skip_topk(True)
++
+         sample_hidden_states = last_hidden_states[token_indices_to_sample]
+ 
+         # Early exit if there is only one draft token to be generated.
+@@ -1416,16 +1427,34 @@
+                         )
+ 
+         if hasattr(target_language_model.model, "topk_indices_buffer"):
++            target_buffer = target_language_model.model.topk_indices_buffer
+             if hasattr(self.model.model, "topk_indices_buffer"):
+                 del self.model.model.topk_indices_buffer
+-            self.model.model.topk_indices_buffer = (
+-                target_language_model.model.topk_indices_buffer
+-            )
++            self.model.model.topk_indices_buffer = target_buffer
++            # Also share at per-module level so that the indexer and
++            # sparse-attention backends in each MTP layer read from
++            # the target model's buffer.
++            for _, module in self.model.model.named_modules():
++                if hasattr(module, "topk_indices_buffer"):
++                    module.topk_indices_buffer = target_buffer
+             logger.info(
+                 "Detected MTP model with topk_indices_buffer. "
+                 "Sharing target model topk_indices_buffer with the draft model."
+             )
+ 
++        # Detect index_share_for_mtp_iteration: when True, the proposer
++        # toggles skip_topk so step 0 computes MTP's own indices and
++        # steps 1+ reuse them.
++        spec_config = self.vllm_config.speculative_config
++        draft_hf_config = (
++            spec_config.draft_model_config.hf_config
++            if spec_config is not None
++            else None
++        )
++        self._share_mtp_indices = getattr(
++            draft_hf_config, "index_share_for_mtp_iteration", False
++        )
++
+         if self.use_local_argmax_reduction:
+             if not hasattr(self.model, "get_top_tokens"):
+                 raise ValueError(
+--- a/vllm/v1/worker/gpu/cudagraph_utils.py
++++ b/vllm/v1/worker/gpu/cudagraph_utils.py
+@@ -3,7 +3,7 @@
+ from collections import defaultdict
+ from collections.abc import Callable
+ from dataclasses import dataclass
+-from typing import Any, NamedTuple
++from typing import Any, NamedTuple, Protocol
+ 
+ import torch
+ import torch.nn as nn
+@@ -33,11 +33,16 @@
+ logger = init_logger(__name__)
+ 
+ 
+-class CapturedAttentionState(NamedTuple):
++class AttentionState(NamedTuple):
+     attn_metadata: dict[str, Any] | None
+     slot_mappings: dict[str, torch.Tensor]
+ 
+ 
++class AttentionStatePair(NamedTuple):
++    warmup: AttentionState
++    captured: AttentionState
++
++
+ @dataclass(frozen=True)
+ class BatchExecutionDescriptor:
+     """Describes the shape of the batch and CG mode to run; this is used to make shape
+@@ -49,6 +54,18 @@
+     uniform_token_count: int | None = None
+ 
+ 
++class CreateForwardFn(Protocol):
++    """Factory that prepares inputs (OUTSIDE the graph) and returns a tuple of
++    (forward_fn, attn_state). Called with warmup=True for the warmup pass and
++    warmup=False for the captured pass."""
++
++    def __call__(
++        self,
++        desc: BatchExecutionDescriptor,
++        warmup: bool,
++    ) -> tuple[Callable[[CUDAGraphMode], None], AttentionState]: ...
++
++
+ def _is_compatible(
+     desc: BatchExecutionDescriptor,
+     num_reqs: int,
+@@ -187,21 +204,21 @@
+     @torch.inference_mode()
+     def capture(
+         self,
+-        create_forward_fn: Callable[
+-            [BatchExecutionDescriptor],
+-            tuple[Callable[[CUDAGraphMode], None], CapturedAttentionState],
+-        ],
++        create_forward_fn: CreateForwardFn,
+         progress_bar_desc: str = "Capturing CUDA graphs",
+-    ) -> dict[BatchExecutionDescriptor, CapturedAttentionState]:
++    ) -> dict[BatchExecutionDescriptor, AttentionStatePair]:
+         """Capture CUDA graphs.
+ 
+         Args:
+             create_forward_fn: Factory that prepares inputs (OUTSIDE graph) and
+-                returns a tuple of (forward_fn, captured_attn_state).
++                returns a tuple of (forward_fn, attn_state). For FULL cudagraph
++                mode, it is invoked once with warmup=True for the warmup pass,
++                and again with warmup=False for the captured pass. For attention
++                backends that perform lazy metadata initialization (e.g. FlashMLA),
++                FULL cudagraph capture requires distinct metadatas for warmup and
++                capture.
+         """
+-        captured_attn_states: dict[
+-            BatchExecutionDescriptor, CapturedAttentionState
+-        ] = {}
++        attn_states: dict[BatchExecutionDescriptor, AttentionStatePair] = {}
+         with graph_capture(device=self.device):
+             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
+             # activations so FULL activations should fit in already allocated
+@@ -215,7 +232,7 @@
+                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
+                 for desc in descs:
+                     # Prepare inputs and get forward function
+-                    forward_fn, attn_state = create_forward_fn(desc)
++                    forward_fn, warmup_attn_state = create_forward_fn(desc, warmup=True)
+ 
+                     # Warmup
+                     forward_fn(CUDAGraphMode.NONE)
+@@ -225,15 +242,18 @@
+                         "CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc
+                     )
+                     if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+-                        captured_attn_states[desc] = attn_state
++                        attn_states[desc] = AttentionStatePair(
++                            warmup_attn_state, warmup_attn_state
++                        )
+                         forward_fn(CUDAGraphMode.PIECEWISE)
+                     else:
+-                        # Capture with fresh attention state. The warmup
+-                        # attention state is discarded because some backends
+-                        # (e.g. FlashMLA) perform lazy initializations that
+-                        # must be captured in the graph.
+-                        forward_fn, attn_state = create_forward_fn(desc)
+-                        captured_attn_states[desc] = attn_state
++                        # Capture with fresh attention state.
++                        forward_fn, capture_attn_state = create_forward_fn(
++                            desc, warmup=False
++                        )
++                        attn_states[desc] = AttentionStatePair(
++                            warmup_attn_state, capture_attn_state
++                        )
+                         assert desc not in self.graphs, (
+                             f"Graph already captured for {desc}"
+                         )
+@@ -251,7 +271,7 @@
+                         self.graphs[desc] = graph
+                         compilation_counter.num_cudagraph_captured += 1
+         self._graphs_captured = True
+-        return captured_attn_states
++        return attn_states
+ 
+     def dispatch(
+         self,
+@@ -313,15 +333,16 @@
+         has_lora: bool = False,
+         use_aux_hidden_state_outputs: bool = False,
+         progress_bar_desc: str = "Capturing CUDA graphs",
+-    ) -> dict[BatchExecutionDescriptor, CapturedAttentionState]:
++    ) -> dict[BatchExecutionDescriptor, AttentionStatePair]:
+         """Capture CUDA graphs for model forward pass."""
+         self.use_aux_hidden_state_outputs = use_aux_hidden_state_outputs
+ 
+         def create_forward_fn(
+             desc: BatchExecutionDescriptor,
++            warmup: bool,
+         ) -> tuple[
+             Callable[[CUDAGraphMode], None],
+-            CapturedAttentionState,
++            AttentionState,
+         ]:
+             num_tokens = desc.num_tokens
+             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+@@ -404,7 +425,7 @@
+                     for k, v in intermediate_tensors.tensors.items():
+                         self.intermediate_tensors[k][:num_tokens] = v
+ 
+-            return forward_fn, CapturedAttentionState(attn_metadata, slot_mappings)
++            return forward_fn, AttentionState(attn_metadata, slot_mappings)
+ 
+         return super().capture(create_forward_fn, progress_bar_desc)
+ 
+@@ -433,7 +454,7 @@
+     attn_groups: list[list[AttentionGroup]],
+     kv_cache_config: KVCacheConfig,
+     skip_attn: bool = False,
+-) -> CapturedAttentionState:
++) -> AttentionState:
+     input_batch = InputBatch.make_dummy(num_reqs, num_tokens, input_buffers)
+     input_block_tables = block_tables.get_dummy_block_tables(num_reqs)
+     slot_mappings = block_tables.get_dummy_slot_mappings(num_tokens)
+@@ -464,4 +485,4 @@
+             kv_cache_config,
+             for_capture=True,
+         )
+-    return CapturedAttentionState(attn_metadata, slot_mappings_by_layer)
++    return AttentionState(attn_metadata, slot_mappings_by_layer)
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -639,7 +639,7 @@
+         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
+ 
+         with self.maybe_setup_dummy_loras(self.lora_config):
+-            captured_attn_states = self.cudagraph_manager.capture(
++            attn_states = self.cudagraph_manager.capture(
+                 self.model,
+                 self.model_state,
+                 self.input_buffers,
+@@ -651,7 +651,7 @@
+                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+             )
+             if self.speculator is not None:
+-                self.speculator.capture(captured_attn_states)
++                self.speculator.capture(attn_states)
+ 
+         end_time = time.perf_counter()
+         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+--- a/vllm/v1/worker/gpu/model_states/default.py
++++ b/vllm/v1/worker/gpu/model_states/default.py
+@@ -178,7 +178,7 @@
+             # Capture with worst-case max_seq_len so the graph is valid at any replay.
+             max_seq_len = self.max_model_len
+         else:
+-            max_seq_len = int(seq_lens_cpu_upper_bound[:num_reqs].max().item())
++            max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+         attn_metadata = build_attn_metadata(
+             attn_groups=attn_groups,
+             num_reqs=num_reqs,
+--- a/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
++++ b/vllm/v1/worker/gpu/model_states/mamba_hybrid.py
+@@ -86,6 +86,12 @@
+             num_tokens = input_batch.num_tokens
+         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
+         max_query_len = input_batch.num_scheduled_tokens.max().item()
++        seq_lens_cpu_upper_bound = input_batch.seq_lens_cpu_upper_bound
++        if for_capture:
++            # Capture with worst-case max_seq_len so the graph is valid at any replay.
++            max_seq_len = self.max_model_len
++        else:
++            max_seq_len = seq_lens_cpu_upper_bound[:num_reqs].max().item()
+ 
+         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
+         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
+@@ -129,7 +135,7 @@
+             query_start_loc_cpu=query_start_loc_cpu,
+             max_query_len=max_query_len,
+             seq_lens=input_batch.seq_lens,
+-            max_seq_len=self.max_model_len,
++            max_seq_len=max_seq_len,
+             block_tables=block_tables,
+             slot_mappings=slot_mappings,
+             kv_cache_config=kv_cache_config,
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/cudagraph.py
+@@ -9,8 +9,9 @@
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.cudagraph_utils import (
++    AttentionState,
++    AttentionStatePair,
+     BatchExecutionDescriptor,
+-    CapturedAttentionState,
+     CudaGraphManager,
+     prepare_inputs_to_capture,
+ )
+@@ -46,12 +47,13 @@
+     def capture(
+         self,
+         forward_fn: Callable,
+-        full_cg_attn_states: dict[BatchExecutionDescriptor, CapturedAttentionState],
++        attn_states: dict[BatchExecutionDescriptor, AttentionStatePair],
+         progress_bar_desc: str = "Capturing CUDA graphs",
+     ) -> None:
+         def create_forward_fn(
+             desc: BatchExecutionDescriptor,
+-        ) -> tuple[Callable[[CUDAGraphMode], None], CapturedAttentionState]:
++            warmup: bool,
++        ) -> tuple[Callable[[CUDAGraphMode], None], AttentionState]:
+             num_tokens = desc.num_tokens
+             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+             num_tokens_across_dp = (
+@@ -59,7 +61,8 @@
+                 if self.dp_size > 1
+                 else None
+             )
+-            attn_state = full_cg_attn_states[desc]
++            attn_state_pair = attn_states[desc]
++            attn_state = attn_state_pair.warmup if warmup else attn_state_pair.captured
+             attn_metadata, slot_mappings = attn_state
+             fwd = lambda cg_mode: forward_fn(
+                 num_reqs,
+@@ -90,7 +93,8 @@
+     ) -> None:
+         def create_forward_fn(
+             desc: BatchExecutionDescriptor,
+-        ) -> tuple[Callable[[CUDAGraphMode], None], CapturedAttentionState]:
++            warmup: bool,
++        ) -> tuple[Callable[[CUDAGraphMode], None], AttentionState]:
+             num_tokens = desc.num_tokens
+             num_reqs = desc.num_reqs or min(num_tokens, self.max_num_reqs)
+             num_tokens_across_dp = (
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/speculator.py
+@@ -20,8 +20,8 @@
+ )
+ from vllm.v1.worker.gpu.block_table import BlockTables
+ from vllm.v1.worker.gpu.cudagraph_utils import (
++    AttentionStatePair,
+     BatchExecutionDescriptor,
+-    CapturedAttentionState,
+     get_uniform_token_count,
+ )
+ from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+@@ -52,6 +52,7 @@
+         self.max_num_reqs = self.scheduler_config.max_num_seqs
+         self.max_num_tokens = self.scheduler_config.max_num_batched_tokens
+         self.max_model_len = vllm_config.model_config.max_model_len
++        self.draft_max_seq_len = self.max_model_len
+         # We need to get the hidden size from the draft model config because
+         # the draft model's hidden size can be different from the target model's
+         # hidden size (e.g., Llama 3.3 70B).
+@@ -409,7 +410,7 @@
+             query_start_loc_cpu=query_start_loc_cpu,
+             max_query_len=1,
+             seq_lens=self.input_buffers.seq_lens[:num_reqs_padded],
+-            max_seq_len=self.max_model_len,
++            max_seq_len=self.draft_max_seq_len,
+             block_tables=block_tables,
+             slot_mappings=slot_mappings,
+             kv_cache_config=self.kv_cache_config,
+@@ -418,7 +419,7 @@
+ 
+     def capture(
+         self,
+-        attn_states: dict[BatchExecutionDescriptor, CapturedAttentionState],
++        attn_states: dict[BatchExecutionDescriptor, AttentionStatePair],
+     ) -> None:
+         logger.info("Capturing model for Eagle speculator...")
+         # Reset indices to zeros to prevent stale values from prior
+@@ -485,6 +486,10 @@
+         num_tokens = input_batch.num_tokens_after_padding
+         num_reqs = input_batch.num_reqs
+         max_query_len = input_batch.num_scheduled_tokens.max()
++        max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
++        self.draft_max_seq_len = min(
++            max_seq_len + self.num_speculative_steps, self.max_model_len
++        )
+ 
+         # NOTE(woosuk): To avoid CPU-GPU synchronization without CPU knowing the
+         # number of rejected tokens, we maintain the size of eagle's input_ids and
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/utils.py
+@@ -76,10 +76,15 @@
+                     del sh.head
+                     sh.head = target_lm_head
+ 
+-    # MTP also shares a topk_indices_buffer between target and draft.
++    # MTP shares topk_indices_buffer with the target model. We update
++    # every module in the draft that holds a buffer reference so that
++    # the per-layer indexer and sparse-attention backends all point to
++    # the target's buffer.
+     if hasattr(target_inner, "topk_indices_buffer"):
+-        if hasattr(draft_inner, "topk_indices_buffer"):
+-            del draft_inner.topk_indices_buffer
+-        draft_inner.topk_indices_buffer = target_inner.topk_indices_buffer
++        target_buffer = target_inner.topk_indices_buffer
++        if target_buffer is not None:
++            for _, module in draft_inner.named_modules():
++                if hasattr(module, "topk_indices_buffer"):
++                    module.topk_indices_buffer = target_buffer
+ 
+     return eagle_model
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4316,6 +4316,21 @@
+ 
+         return None
+ 
++    def _input_fits_in_drafter(
++        self, common_attn_metadata: CommonAttentionMetadata | None
++    ) -> bool:
++        if common_attn_metadata is None:
++            return False
++        assert self.speculative_config is not None
++        # DFlash queries one extra token (the bonus token) beyond num_spec_tokens
++        num_drafter_query_tokens = self.num_spec_tokens + (
++            1 if self.speculative_config.use_dflash() else 0
++        )
++        return (
++            common_attn_metadata.max_seq_len + num_drafter_query_tokens
++            <= self.effective_drafter_max_model_len
++        )
++
+     @torch.inference_mode
+     def sample_tokens(
+         self, grammar_output: "GrammarOutput | None"
+@@ -4403,9 +4418,8 @@
+         propose_drafts_after_bookkeeping = False
+         if spec_config is not None:
+             # Decide whether to run the drafter or zero out draft tokens.
+-            input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
+-                spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
+-                <= self.effective_drafter_max_model_len
++            input_fits_in_drafter = self._input_fits_in_drafter(
++                spec_decode_common_attn_metadata
+             )
+             use_gpu_toks = (
+                 spec_config.use_eagle()
+@@ -5743,6 +5757,9 @@
+                     num_scheduled_tokens, self.query_pos.np
+                 )
+                 self.query_start_loc.np[1 : num_reqs + 1] = cum_num_tokens
++                self.query_start_loc.np[num_reqs + 1 : num_reqs_padded + 1].fill(
++                    cum_num_tokens[-1]
++                )
+                 self.query_start_loc.copy_to_gpu()
+ 
+                 # Sync block table CPU->GPU so cleared rows from
+--- a/vllm/models/deepseek_v4/nvidia/mtp.py
++++ b/vllm/models/deepseek_v4/nvidia/mtp.py
+@@ -85,6 +85,7 @@
+             bias=False,
+             return_bias=False,
+             quant_config=quant_config,
++            prefix=f"{prefix}.e_proj",
+         )
+         self.h_proj = ReplicatedLinear(
+             config.hidden_size,
+@@ -92,6 +93,7 @@
+             bias=False,
+             return_bias=False,
+             quant_config=quant_config,
++            prefix=f"{prefix}.h_proj",
+         )
+ 
+         self.hc_eps = config.hc_eps
+--- a/vllm/models/deepseek_v4/amd/mtp.py
++++ b/vllm/models/deepseek_v4/amd/mtp.py
+@@ -82,6 +82,7 @@
+             bias=False,
+             return_bias=False,
+             quant_config=quant_config,
++            prefix=f"{prefix}.e_proj",
+         )
+         self.h_proj = ReplicatedLinear(
+             config.hidden_size,
+@@ -89,6 +90,7 @@
+             bias=False,
+             return_bias=False,
+             quant_config=quant_config,
++            prefix=f"{prefix}.h_proj",
+         )
+ 
+         self.hc_eps = config.hc_eps
