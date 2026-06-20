@@ -864,10 +864,14 @@ class SlidingWindowMLAManager(SlidingWindowManager):
             return
 
         aligned_num_hit_blocks = aligned_cache_hit_length // self.block_size
-        last_full_prompt_block = max_cache_hit_length // self.block_size
         contiguous_blocks = cdiv(self.sliding_window - 1, self.block_size)
         first_protected_block = max(0, aligned_num_hit_blocks - contiguous_blocks)
-        last_protected_block = max(aligned_num_hit_blocks, last_full_prompt_block)
+        # issue #2289 ②: do NOT protect the transient tail past the stable
+        # aligned cache-hit prefix. eagle/MTP recomputes the last matched
+        # block every request as a fresh physical block, so pinning the tail
+        # pins a new block_id each request (dedup can't catch it) -> a +~1.5
+        # block/req leak with no reuse benefit (the tail is recomputed anyway).
+        last_protected_block = aligned_num_hit_blocks
         blocks = self.req_to_blocks[request.request_id]
         protected_blocks = blocks[
             first_protected_block : min(last_protected_block, len(blocks))

@@ -382,12 +382,15 @@ class BlockPool:
             # The block doesn't have hash, eviction is not needed
             return False
 
-        if self.cached_block_hash_to_block.pop(block_hash, block.block_id) is None:
-            # block not found in cached_block_hash_to_block,
-            # eviction is not needed
-            return False
-
+        popped = self.cached_block_hash_to_block.pop(block_hash, block.block_id)
+        # issue #2289: reset the block hash whenever it has one, even if the
+        # hash was already absent from the map (stale). A reused block that
+        # keeps a stale _block_hash leaks pool usage and collapses the
+        # prefix-cache hit rate. (reset_hash previously ran past this guard.)
         block.reset_hash()
+        if popped is None:
+            # block not found in cached_block_hash_to_block, eviction not needed
+            return False
 
         if self.enable_kv_cache_events:
             self.kv_event_queue.append(
